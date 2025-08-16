@@ -1,0 +1,41 @@
+# OS / IDEs
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Node (frontend)
+node_modules/
+dist/
+build/
+npm-debug.log*
+yarn-error.log*
+
+# Java (backend)
+target/
+build/
+.gradle/
+.out/
+
+# Python (if any tooling/scripts)
+__pycache__/
+*.pyc
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Env & secrets
+.env
+.env.*
+*.local
+*.secret
+secrets/*.json
+
+# Docker
+**/docker/*.log
+**/docker/*.tmp
+
+# Others
+coverage/
+logs/

@@ -1,0 +1,3 @@
+זהו קובץ דוגמה קצר בעברית המדגים אינדקס מסמכים למערכת RAG.
+This is a short English sample file demonstrating document indexing for RAG.
+למידת חיזוק (Reinforcement Learning) היא פרדיגמה בלמידת מכונה שבה סוכן לומד על ידי אינטראקציה עם סביבה.
