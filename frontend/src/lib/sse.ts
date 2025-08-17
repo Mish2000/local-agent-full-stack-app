@@ -1,15 +1,53 @@
+export type Source = {
+    id: number;
+    source: string;
+    preview: string;
+    score: number;
+    start_line?: number;
+    end_line?: number;
+};
+
+export type ToolEvent = {
+    name: string;
+    args?: Record<string, never>;
+    result?: never;
+    error?: string;
+};
+
 export type SSEHandlers = {
     onToken: (t: string) => void;
     onDone: () => void;
     onError: (msg: string) => void;
+    onSources?: (arr: Source[]) => void;
+    onTool?: (ev: ToolEvent) => void;
 };
 
-export function openChatSSE(query: string, handlers: SSEHandlers): EventSource {
-    const url = `http://localhost:8000/chat/stream?q=${encodeURIComponent(query)}`;
+export type RagMode = "auto" | "none" | "dense" | "rerank";
+
+export function openChatSSE(
+    prompt: string,
+    handlers: SSEHandlers,
+    opts?: { mode?: RagMode }
+): EventSource {
+    const base = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+    const mode: RagMode = opts?.mode ?? "auto";
+    const url = `${base}/chat/stream?q=${encodeURIComponent(prompt)}&mode=${mode}`;
     const es = new EventSource(url);
 
-    es.addEventListener("token", (e) => {
-        handlers.onToken((e as MessageEvent).data ?? "");
+    es.addEventListener("token", (e: MessageEvent) => handlers.onToken(e.data));
+
+    es.addEventListener("sources", (e: MessageEvent) => {
+        try {
+            const arr = JSON.parse(e.data);
+            handlers.onSources?.(arr);
+        } catch { /* ignore */ }
+    });
+
+    es.addEventListener("tool", (e: MessageEvent) => {
+        try {
+            const obj = JSON.parse(e.data);
+            handlers.onTool?.(obj);
+        } catch { /* ignore */ }
     });
 
     es.addEventListener("done", () => {
@@ -17,15 +55,9 @@ export function openChatSSE(query: string, handlers: SSEHandlers): EventSource {
         es.close();
     });
 
-    es.addEventListener("error", (e) => {
-        try {
-            const data = (e as MessageEvent).data ?? "SSE error";
-            handlers.onError(String(data));
-        } catch {
-            handlers.onError("SSE connection error");
-        }
-    });
-
+    es.onerror = () => {
+        handlers.onError("SSE connection error");
+        es.close();
+    };
     return es;
 }
-

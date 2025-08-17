@@ -60,16 +60,8 @@ html, body, #root {
     height: 100%;
     padding-bottom: 16px;              /* space above composer */
     direction: ltr;                    /* keep scrollbar on the RIGHT in RTL locales */
-
-    /* Reliable snap so a message can be locked to the top */
     scroll-snap-type: y mandatory;
     scrollbar-gutter: stable;
-}
-
-/* Snap points for messages; also allow a tiny top offset so prior msg is fully hidden */
-.msg {
-    scroll-snap-align: start;
-    scroll-margin-top: 1px;            /* ensures previous item is completely out of view */
 }
 
 /* Modern scrollbar styling */
@@ -78,6 +70,23 @@ html, body, #root {
 .chat::-webkit-scrollbar-track { background: var(--scroll-track); border-radius: 8px; }
 .chat::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 8px; }
 .chat::-webkit-scrollbar-thumb:hover { filter: brightness(0.95); }
+
+/* ---- MESSAGE BLOCKS (bidi-robust) ---- */
+.msg {
+    scroll-snap-align: start;
+    scroll-margin-top: 1px;          /* ensure previous item fully out of view */
+    text-align: start;               /* follows dir (rtl => right, ltr => left) */
+}
+
+/* Force per-message bidi independent of container */
+.msg[dir="rtl"] {
+    direction: rtl;
+    unicode-bidi: plaintext;
+}
+.msg[dir="ltr"] {
+    direction: ltr;
+    unicode-bidi: plaintext;
+}
 
 /* User bubble */
 .bubble {

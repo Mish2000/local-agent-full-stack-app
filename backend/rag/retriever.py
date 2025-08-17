@@ -1,8 +1,10 @@
 import os
-# Disable telemetry and mute logs
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
-
 import logging
+import re
+from typing import List, Dict, Any
+
+# Silence Chroma telemetry noise
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 for name in (
     "chromadb.telemetry",
     "chromadb.telemetry.product",
@@ -13,43 +15,84 @@ for name in (
 
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
-EMBED_MODEL_NAME = "BAAI/bge-m3"
-CHROMA_DIR = "chroma_db"
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 COLLECTION = "docs"
+RERANKER_NAME = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
 
-class SimpleRetriever:
-    def __init__(self, k: int = 5):
-        self.client = chromadb.PersistentClient(
-            path=CHROMA_DIR,
-            settings=Settings(anonymized_telemetry=False)
-        )
+_HE_STOP = {
+    "של","עם","על","לא","כן","אם","או","זה","זו","אלה","הוא","היא","הם","הן",
+    "אני","אתה","את","אתם","אתן","אנחנו","וכו","כל","גם","אך","אך־","אבל","כדי",
+    "כי","כמו","אלא","שרק","רק","עוד","כבר","שהוא","שהיא","שזה","שזו","שאין","אין",
+    "היה","הייתה","היו","יש","מאוד","בה","בו","בהם","בהן","לפי","מתוך",
+}
+_EN_STOP = {
+    "the","a","an","and","or","but","if","so","to","of","in","on","for","by","with","as","at",
+    "is","are","was","were","be","been","being","it","this","that","these","those","from",
+    "i","you","he","she","we","they","them","his","her","their","our","your","my","me",
+}
+
+def _normalize_query(q: str) -> str:
+    q = q.strip().lower()
+    q = re.sub(r"[^\w\u0590-\u05FF\s]+", " ", q)
+    toks = [t for t in q.split() if t not in _EN_STOP and t not in _HE_STOP]
+    return " ".join(toks) if toks else q
+
+class Retriever:
+    """
+    Two-stage retriever:
+      1) Dense retrieve (BGE-M3) from Chroma
+      2) Optional CrossEncoder rerank (bge-reranker-base) for multilingual precision
+    """
+
+    def __init__(self, k_initial: int = 12, k_final: int = 5, use_reranker: bool = True):
+        self.client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
         self.coll = self.client.get_or_create_collection(COLLECTION)
         self.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-        self.k = k
+        self.reranker = CrossEncoder(RERANKER_NAME) if use_reranker else None
+        self.k_initial = k_initial
+        self.k_final = k_final
+        self.use_reranker = use_reranker
 
-    def query(self, q: str):
-        qvec = self.embedder.encode([q], normalize_embeddings=True)[0].tolist()
+    def retrieve(self, query: str) -> List[Dict[str, Any]]:
+        q_norm = _normalize_query(query) or query
+
+        # Dense retrieve
+        qvec = self.embedder.encode([q_norm], normalize_embeddings=True)[0].tolist()
         res = self.coll.query(
             query_embeddings=[qvec],
-            n_results=self.k,
+            n_results=self.k_initial,
             include=["documents", "metadatas", "distances"],
         )
-        docs = []
+
+        candidates: List[Dict[str, Any]] = []
         if res and res.get("documents"):
             for i, doc in enumerate(res["documents"][0]):
-                meta = res["metadatas"][0][i]
+                meta = res["metadatas"][0][i] or {}
                 dist = float(res["distances"][0][i])
-                docs.append({
+                candidates.append({
                     "text": doc,
                     "source": meta.get("source"),
                     "chunk": meta.get("chunk"),
+                    "start_line": int(meta.get("start_line") or 0),
+                    "end_line": int(meta.get("end_line") or 0),
                     "distance": dist,
                 })
-        return docs
 
-if __name__ == "__main__":
-    r = SimpleRetriever(k=3)
-    for d in r.query("הסבר קצר על למידת חיזוק"):
-        print(d["distance"], d["source"], "…", d["text"][:120].replace("\n", " "))
+        if not candidates:
+            return []
+
+        # Rerank or distance sort
+        if self.use_reranker and self.reranker is not None:
+            pairs = [[query, c["text"]] for c in candidates]
+            scores = self.reranker.predict(pairs)
+            for c, s in zip(candidates, scores):
+                c["score"] = float(s)
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+        else:
+            # smaller distance is better
+            candidates.sort(key=lambda x: x["distance"])
+
+        return candidates[: self.k_final]

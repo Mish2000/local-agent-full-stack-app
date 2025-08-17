@@ -1,107 +1,147 @@
-import os
-# Disable Chroma telemetry and mute telemetry logs before imports
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
-
-import logging
-for name in (
-    "chromadb.telemetry",
-    "chromadb.telemetry.product",
-    "chromadb.telemetry.product.posthog",
-):
-    logging.getLogger(name).setLevel(logging.CRITICAL)
-    logging.getLogger(name).disabled = True
-
 import argparse
-import uuid
+import os
+import hashlib
 from pathlib import Path
+from typing import List, Tuple
+
+# Silence Chroma telemetry
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
+
 import docx2txt
+from pypdf import PdfReader
 
-EMBED_MODEL_NAME = "BAAI/bge-m3"
-CHROMA_DIR = "chroma_db"
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 COLLECTION = "docs"
-ALLOWED_EXTS = {".pdf", ".txt", ".md", ".csv", ".log", ".docx"}
 
-def load_text_from_file(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext == ".pdf":
-        reader = PdfReader(str(path))
-        return "\n".join([(page.extract_text() or "") for page in reader.pages])
-    if ext in {".txt", ".md", ".csv", ".log"}:
-        return path.read_text(encoding="utf-8", errors="ignore")
-    if ext == ".docx":
-        return docx2txt.process(str(path)) or ""
+TEXT_EXTS = {".txt", ".md"}
+DOCX_EXTS = {".docx"}
+PDF_EXTS = {".pdf"}
+
+def read_text_file(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx_file(p: Path) -> str:
+    return docx2txt.process(str(p)) or ""
+
+def read_pdf_file(p: Path) -> str:
+    text_parts: List[str] = []
+    reader = PdfReader(str(p))
+    for page in reader.pages:
+        text_parts.append(page.extract_text() or "")
+    return "\n".join(text_parts)
+
+def load_text(p: Path) -> str:
+    suf = p.suffix.lower()
+    if suf in TEXT_EXTS:
+        return read_text_file(p)
+    if suf in DOCX_EXTS:
+        return read_docx_file(p)
+    if suf in PDF_EXTS:
+        return read_pdf_file(p)
     return ""
 
-def iter_documents(src_dir: Path):
-    for p in src_dir.rglob("*"):
-        if p.is_file() and p.suffix.lower() in ALLOWED_EXTS:
-            text = load_text_from_file(p).strip()
-            if text:
-                yield str(p), text
+def iter_files(root: Path) -> List[Path]:
+    out = []
+    for ext in (TEXT_EXTS | DOCX_EXTS | PDF_EXTS):
+        out.extend(root.rglob(f"*{ext}"))
+    return sorted(set(out))
 
-def chunk_text(text: str):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=700, chunk_overlap=100, separators=["\n\n", "\n", " ", ""]
-    )
-    return splitter.split_text(text)
+def make_line_chunks(text: str, max_chars: int = 1200, overlap_lines: int = 2) -> List[Tuple[str, int, int]]:
+    """
+    Chunk by lines so we can compute exact line ranges.
+    Returns list of (chunk_text, start_line_1based, end_line_1based).
+    """
+    lines = text.splitlines()
+    n = len(lines)
+    chunks: List[Tuple[str, int, int]] = []
+    i = 0
+    while i < n:
+        j = i
+        total = 0
+        while j < n:
+            # +1 for the implicit newline that will be re-joined
+            next_len = len(lines[j]) + (1 if total > 0 else 0)
+            if total + next_len > max_chars and j > i:
+                break
+            total += next_len
+            j += 1
+        if j == i:  # very long single line; force include
+            j = i + 1
+        # Build chunk text
+        chunk_lines = lines[i:j]
+        chunk_text = "\n".join(chunk_lines).strip()
+        if chunk_text:
+            start_line = i + 1
+            end_line = j
+            chunks.append((chunk_text, start_line, end_line))
+        # Move window with overlap
+        i = max(i + 1, j - overlap_lines if overlap_lines > 0 else j)
+    return chunks
 
-def seed_sample_if_empty(src_dir: Path) -> None:
-    if any(src_dir.rglob("*")):
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", required=True, help="Folder to index (recursively)")
+    args = ap.parse_args()
+
+    src_root = Path(args.src).resolve()
+    if not src_root.exists():
+        print(f"[ingest] Source folder not found: {src_root}")
         return
-    sample = src_dir / "sample_seed_he_en.txt"
-    sample.write_text(
-        "זהו קובץ דוגמה קצר בעברית המדגים אינדקס מסמכים למערכת RAG.\n"
-        "This is a short English sample file demonstrating document indexing for RAG.\n"
-        "למידת חיזוק (Reinforcement Learning) היא פרדיגמה בלמידת מכונה שבה סוכן לומד על ידי אינטראקציה עם סביבה.\n",
-        encoding="utf-8",
-    )
-
-def main(src: str):
-    src_dir = Path(src).resolve()
-    assert src_dir.exists(), f"Source dir not found: {src_dir}"
-    seed_sample_if_empty(src_dir)
 
     print(f"[ingest] Loading embedder: {EMBED_MODEL_NAME}")
     embedder = SentenceTransformer(EMBED_MODEL_NAME)
 
     print(f"[ingest] Connecting to Chroma at: {CHROMA_DIR}")
-    client = chromadb.PersistentClient(
-        path=CHROMA_DIR,
-        settings=Settings(anonymized_telemetry=False)
-    )
+    client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
     coll = client.get_or_create_collection(COLLECTION)
 
-    total = 0
-    found_any = False
-    for path, text in iter_documents(src_dir):
-        found_any = True
-        chunks = chunk_text(text)
-        if not chunks:
+    files = iter_files(src_root)
+    if not files:
+        print(f"[ingest] No files found under: {src_root}")
+        return
+
+    added = 0
+    for p in files:
+        text = load_text(p)
+        if not text.strip():
             continue
+        chunks = make_line_chunks(text, max_chars=1200, overlap_lines=2)
+        print(f"[ingest] {p} -> {len(chunks)} chunks")
 
-        embeddings = embedder.encode(
-            chunks, normalize_embeddings=True, show_progress_bar=True
-        )
+        # Prepare batches (use upsert so re-runs refresh)
+        ids, docs, metas, embs = [], [], [], []
+        for idx, (chunk_text, start_line, end_line) in enumerate(chunks):
+            uid = f"{p.as_posix()}::lines:{start_line}-{end_line}::sha1:{sha1(chunk_text)[:8]}"
+            ids.append(uid)
+            docs.append(chunk_text)
+            metas.append({
+                "source": str(p),
+                "chunk": idx,
+                "start_line": start_line,
+                "end_line": end_line,
+            })
 
-        ids = [str(uuid.uuid4()) for _ in chunks]
-        metadatas = [{"source": path, "chunk": i} for i, _ in enumerate(chunks)]
+        # Compute embeddings once for the batch
+        vectors = embedder.encode(docs, normalize_embeddings=True)
+        embs.extend(vectors)
 
-        coll.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
-        total += len(chunks)
-        print(f"[ingest] {path} -> {len(chunks)} chunks")
+        # Upsert (falls back to add if new)
+        if hasattr(coll, "upsert"):
+            coll.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+        else:
+            coll.add(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
 
-    if not found_any:
-        print(f"[ingest] No supported files in {src_dir}. Supported: {sorted(ALLOWED_EXTS)}")
-    print(f"[ingest] Done. Added {total} chunks to '{COLLECTION}' in {CHROMA_DIR}")
+        added += len(docs)
+
+    print(f"[ingest] Done. Added/updated {added} chunks to '{COLLECTION}' in {CHROMA_DIR}")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="data", help="Folder with documents to index")
-    args = ap.parse_args()
-    main(args.src)
+    main()
