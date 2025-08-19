@@ -29,6 +29,7 @@ const Header = forwardRef<HTMLElement, Props>(({ backendStatus, ragMode, onChang
                         <option value="none">None</option>
                         <option value="dense">Dense</option>
                         <option value="rerank">+Rerank</option>
+                        <option value="web">Web (search)</option>{/* NEW */}
                     </select>
                 </label>
             </div>

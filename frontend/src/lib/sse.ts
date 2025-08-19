@@ -5,6 +5,7 @@ export type Source = {
     score: number;
     start_line?: number;
     end_line?: number;
+    url?: string;
 };
 
 export type ToolEvent = {
@@ -20,9 +21,10 @@ export type SSEHandlers = {
     onError: (msg: string) => void;
     onSources?: (arr: Source[]) => void;
     onTool?: (ev: ToolEvent) => void;
+    onTrace?: (traceId: string) => void; // NEW
 };
 
-export type RagMode = "auto" | "none" | "dense" | "rerank";
+export type RagMode = "auto" | "none" | "dense" | "rerank" | "web";
 
 export function openChatSSE(
     prompt: string,
@@ -35,6 +37,13 @@ export function openChatSSE(
     const es = new EventSource(url);
 
     es.addEventListener("token", (e: MessageEvent) => handlers.onToken(e.data));
+
+    es.addEventListener("trace", (e: MessageEvent) => {
+        try {
+            const obj = JSON.parse(e.data);
+            if (obj?.id) handlers.onTrace?.(obj.id);
+        } catch { /* ignore */ }
+    });
 
     es.addEventListener("sources", (e: MessageEvent) => {
         try {

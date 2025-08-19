@@ -1,0 +1,766 @@
+﻿
+### FILE: src\components\ChatMessage.tsx ###
+
+import { detectDir, type Dir } from "../lib/text";
+
+type Props = {
+    id: string;
+    role: "user" | "assistant";
+    content: string;
+};
+
+export default function ChatMessage({ id, role, content }: Props) {
+    const dir: Dir = detectDir(content);
+    const baseStyle: React.CSSProperties = {
+        alignSelf: "flex-end",
+        marginLeft: "auto",
+        maxWidth: "80ch",
+    };
+
+    if (role === "user") {
+        return (
+            <div id={id} className="msg bubble bubble-user" dir={dir} style={baseStyle}>
+                {content}
+            </div>
+        );
+    }
+
+    return (
+        <div id={id} className="msg assistant" dir={dir} style={baseStyle}>
+            {content}
+        </div>
+    );
+}
+
+### FILE: src\components\Composer.tsx ###
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { type Dir, detectDir } from "../lib/text";
+
+type Props = {
+    disabled: boolean;
+    onSend: (text: string, dir: Dir) => void;
+    onHeightChange?: (h: number) => void;
+};
+
+export default function Composer({ disabled, onSend, onHeightChange }: Props) {
+    const [text, setText] = useState("");
+    const [lastDir, setLastDir] = useState<Dir>("rtl");
+
+    const footerRef = useRef<HTMLElement | null>(null);
+    const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+    // When typing => detect from content. When empty => remember last direction.
+    const inputDir: Dir = text.trim() ? detectDir(text) : lastDir;
+    const placeholder = useMemo(
+        () => (lastDir === "rtl" ? "×©××œ ×›×œ ×“×‘×¨â€¦" : "Ask anythingâ€¦"),
+        [lastDir]
+    );
+
+    useEffect(() => {
+        if (text.trim()) setLastDir(detectDir(text));
+    }, [text]);
+
+    const resizeTextarea = () => {
+        const el = taRef.current;
+        if (!el) return;
+        el.style.height = "auto";
+        const max = Math.floor(window.innerHeight * 0.3);
+        const next = Math.min(el.scrollHeight, max);
+        el.style.height = `${next}px`;
+        if (onHeightChange && footerRef.current) {
+            onHeightChange(footerRef.current.getBoundingClientRect().height);
+        }
+    };
+
+    useEffect(() => { resizeTextarea(); }, []);
+    useEffect(() => { resizeTextarea(); }, [text]);
+    useEffect(() => {
+        const onResize = () => resizeTextarea();
+        window.addEventListener("resize", onResize);
+        return () => window.removeEventListener("resize", onResize);
+    }, []);
+
+    const submit = () => {
+        const value = text.trim();
+        if (!value || disabled) return;
+        onSend(value, inputDir);
+        setLastDir(inputDir);
+        setText("");
+    };
+
+    return (
+        <footer ref={footerRef} className="footer-fixed">
+            <div
+                className="container"
+                style={{ padding: 16, display: "flex", gap: 8, direction: "rtl", alignItems: "flex-end" }}
+            >
+        <textarea
+            ref={taRef}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    submit();
+                }
+            }}
+            placeholder={placeholder}
+            className="input textarea"
+            disabled={disabled}
+            dir={inputDir}
+            rows={1}
+        />
+                <button
+                    onClick={submit}
+                    disabled={disabled || !text.trim()}
+                    className="button"
+                    style={{ alignSelf: "flex-end" }}
+                >
+                    {disabled ? "×ž×™×™×¦×¨â€¦" : "×©×œ×—"}
+                </button>
+            </div>
+        </footer>
+    );
+}
+
+### FILE: src\components\Header.tsx ###
+
+import { forwardRef } from "react";
+import type { RagMode } from "../lib/sse";
+
+type Props = {
+    backendStatus: string;
+    ragMode: RagMode;
+    onChangeMode: (m: RagMode) => void;
+};
+
+const Header = forwardRef<HTMLElement, Props>(({ backendStatus, ragMode, onChangeMode }, ref) => {
+    return (
+        <header ref={ref} className="header">
+            <div className="container" style={{ padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                    <h1 style={{ fontSize: 22, margin: 0 }}>Local AI Agent â€” Chat</h1>
+                    <p style={{ margin: "6px 0 0 0", opacity: 0.85 }}>
+                        Backend health: <b>{backendStatus}</b>
+                    </p>
+                </div>
+
+                <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14 }}>
+                    <span>Context</span>
+                    <select
+                        value={ragMode}
+                        onChange={(e) => onChangeMode(e.target.value as RagMode)}
+                        style={{ padding: "6px 8px", borderRadius: 8 }}
+                    >
+                        <option value="auto">Auto (tools)</option>
+                        <option value="none">None</option>
+                        <option value="dense">Dense</option>
+                        <option value="rerank">+Rerank</option>
+                        <option value="web">Web (search)</option>{/* NEW */}
+                    </select>
+                </label>
+            </div>
+        </header>
+    );
+});
+
+export default Header;
+
+### FILE: src\components\SourcesBar.tsx ###
+
+import type { Source } from "../lib/sse";
+
+function baseName(p: string) {
+    if (!p) return "unknown";
+    const parts = p.replaceAll("\\", "/").split("/");
+    return parts[parts.length - 1] || p;
+}
+
+function hostFromUrl(u?: string) {
+    if (!u) return "";
+    try {
+        const { host } = new URL(u);
+        return host || "";
+    } catch {
+        return "";
+    }
+}
+
+export default function SourcesBar({ items }: { items: Source[] }) {
+    if (!items || items.length === 0) return null;
+    return (
+        <div className="container" style={{ padding: "6px 16px 16px 16px" }}>
+            <div style={{ fontSize: 13, opacity: 0.85, marginBottom: 6, textAlign: "end" }}>×ž×§×•×¨×•×ª</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                {items.map((s) => {
+                    const range = s.start_line && s.end_line ? ` Â· lines ${s.start_line}-${s.end_line}` : "";
+                    const label = hostFromUrl(s.url) || baseName(s.source);
+                    const chipStyle: React.CSSProperties = {
+                        border: "1px solid var(--border)",
+                        background: "var(--panel)",
+                        color: "var(--text-strong)",
+                        borderRadius: 999,
+                        padding: "6px 10px",
+                        fontSize: 13,
+                        maxWidth: 360,
+                        textOverflow: "ellipsis",
+                        overflow: "hidden",
+                        whiteSpace: "nowrap",
+                    };
+                    if (s.url) {
+                        return (
+                            <a
+                                key={s.id}
+                                href={s.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={s.preview}
+                                style={{ ...chipStyle, textDecoration: "none" }}
+                            >
+                                [{s.id}] {label}{range}
+                            </a>
+                        );
+                    }
+                    return (
+                        <div key={s.id} title={s.preview} style={chipStyle}>
+                            [{s.id}] {label}{range}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+### FILE: src\components\ToolCalls.tsx ###
+
+import type { ToolEvent } from "../lib/sse";
+
+export default function ToolCalls({ items }: { items: ToolEvent[] }) {
+    if (!items || items.length === 0) return null;
+    return (
+        <div className="container" style={{ padding: "0 16px 12px 16px" }}>
+            <details style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 12, padding: "10px 12px" }} open>
+                <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+                    Tool calls ({items.length})
+                </summary>
+                <div style={{ display: "grid", gap: 8, marginTop: 8, direction: "ltr" }}>
+                    {items.map((t, i) => (
+                        <div key={i} style={{ border: "1px solid var(--border)", borderRadius: 10, padding: "8px 10px", background: "var(--bg)" }}>
+                            <div style={{ fontSize: 13, opacity: 0.9 }}>
+                                <b>name:</b> {t.name}
+                            </div>
+                            {t.args && (
+                                <pre style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+{JSON.stringify(t.args, null, 2)}
+                                </pre>
+                            )}
+                            {t.error && (
+                                <div style={{ color: "#ef4444", marginTop: 6 }}>
+                                    Error: {t.error}
+                                </div>
+                            )}
+                            {t.result && (
+                                <pre style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>
+{JSON.stringify(t.result, null, 2)}
+                                </pre>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            </details>
+        </div>
+    );
+}
+
+### FILE: src\lib\sse.ts ###
+
+export type Source = {
+    id: number;
+    source: string;
+    preview: string;
+    score: number;
+    start_line?: number;
+    end_line?: number;
+    url?: string; // NEW: click-through to publisher/source
+};
+
+export type ToolEvent = {
+    name: string;
+    args?: Record<string, never>;
+    result?: never;
+    error?: string;
+};
+
+export type SSEHandlers = {
+    onToken: (t: string) => void;
+    onDone: () => void;
+    onError: (msg: string) => void;
+    onSources?: (arr: Source[]) => void;
+    onTool?: (ev: ToolEvent) => void;
+};
+
+export type RagMode = "auto" | "none" | "dense" | "rerank" | "web"; // NEW: web
+
+export function openChatSSE(
+    prompt: string,
+    handlers: SSEHandlers,
+    opts?: { mode?: RagMode }
+): EventSource {
+    const base = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+    const mode: RagMode = opts?.mode ?? "auto";
+    const url = `${base}/chat/stream?q=${encodeURIComponent(prompt)}&mode=${mode}`;
+    const es = new EventSource(url);
+
+    es.addEventListener("token", (e: MessageEvent) => handlers.onToken(e.data));
+
+    es.addEventListener("sources", (e: MessageEvent) => {
+        try {
+            const arr = JSON.parse(e.data);
+            handlers.onSources?.(arr);
+        } catch { /* ignore */ }
+    });
+
+    es.addEventListener("tool", (e: MessageEvent) => {
+        try {
+            const obj = JSON.parse(e.data);
+            handlers.onTool?.(obj);
+        } catch { /* ignore */ }
+    });
+
+    es.addEventListener("done", () => {
+        handlers.onDone();
+        es.close();
+    });
+
+    es.onerror = () => {
+        handlers.onError("SSE connection error");
+        es.close();
+    };
+    return es;
+}
+
+### FILE: src\lib\text.ts ###
+
+export type Dir = "rtl" | "ltr";
+
+export const hebrewRegex = /[\u0590-\u05FF]/;
+
+export const looksLikeCode = (s: string) =>
+    s.includes("```") ||
+    /[#;{}()[\]<>=]|\/\/|\/\*|\bclass\b|\bdef\b|\bfunction\b|\bimport\b|\b#include\b/i.test(s);
+
+/** Decide visual direction from message content. Code is always LTR. */
+export const detectDir = (s: string): Dir =>
+    looksLikeCode(s) ? "ltr" : hebrewRegex.test(s) ? "rtl" : "ltr";
+
+### FILE: src\App.tsx ###
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { openChatSSE, type RagMode, type Source, type ToolEvent } from "./lib/sse"; // import types
+import Header from "./components/Header";
+import ChatMessage from "./components/ChatMessage";
+import Composer from "./components/Composer";
+import SourcesBar from "./components/SourcesBar";
+import ToolCalls from "./components/ToolCalls";
+import { type Dir, detectDir, looksLikeCode } from "./lib/text";
+
+type Msg = { role: "user" | "assistant"; content: string; dir: Dir };
+
+export default function App() {
+    const [backendStatus, setBackendStatus] = useState<string>("checking...");
+    const [messages, setMessages] = useState<Msg[]>([]);
+    const [streaming, setStreaming] = useState(false);
+    const [ragMode, setRagMode] = useState<RagMode>("auto");
+
+    const [lastSources, setLastSources] = useState<Source[] | null>(null);
+    const [lastTools, setLastTools] = useState<ToolEvent[]>([]);
+
+    const headerRef = useRef<HTMLElement | null>(null);
+    const composerH = useRef<number>(96);
+    const headerH = useRef<number>(64);
+
+    const viewportRef = useRef<HTMLDivElement | null>(null);
+    const chatRef = useRef<HTMLDivElement | null>(null);
+    const esRef = useRef<EventSource | null>(null);
+
+    const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
+    const [showJumpDown, setShowJumpDown] = useState(false);
+    const [jumpBtnBottom, setJumpBtnBottom] = useState<number>(84);
+
+    useEffect(() => {
+        fetch("http://localhost:8000/healthz")
+            .then((r) => r.json())
+            .then((j) => setBackendStatus(j.status ?? "unknown"))
+            .catch(() => setBackendStatus("backend unreachable"));
+    }, []);
+
+    const layoutViewport = useCallback(() => {
+        const vp = viewportRef.current;
+        if (!vp) return;
+        const top = headerH.current;
+        const bottom = composerH.current;
+        vp.style.top = `${top}px`;
+        vp.style.bottom = `${bottom}px`;
+        setJumpBtnBottom(Math.max(bottom + 12, 84));
+    }, []);
+
+    useEffect(() => {
+        const measure = () => {
+            if (headerRef.current) {
+                headerH.current = headerRef.current.getBoundingClientRect().height;
+            }
+            layoutViewport();
+        };
+        measure();
+        window.addEventListener("resize", measure);
+        return () => window.removeEventListener("resize", measure);
+    }, [layoutViewport]);
+
+    const onComposerHeight = (h: number) => {
+        composerH.current = h;
+        layoutViewport();
+    };
+
+    const recomputeBottomState = useCallback(() => {
+        const el = chatRef.current;
+        if (!el) return;
+        const atBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 24;
+        setShowJumpDown(!atBottom);
+    }, []);
+
+    useEffect(() => {
+        const el = chatRef.current;
+        if (!el) return;
+        const onScroll = () => recomputeBottomState();
+        el.addEventListener("scroll", onScroll);
+        return () => el.removeEventListener("scroll", onScroll);
+    }, [recomputeBottomState]);
+
+    useEffect(() => { recomputeBottomState(); }, [messages, recomputeBottomState]);
+
+    useEffect(() => {
+        const el = chatRef.current;
+        if (!el || typeof ResizeObserver === "undefined") return;
+        const ro = new ResizeObserver(() => recomputeBottomState());
+        ro.observe(el);
+        return () => ro.disconnect();
+    }, [recomputeBottomState]);
+
+    const snapMessageToTop = (msgEl: HTMLElement) => {
+        msgEl.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
+        const scroller = chatRef.current!;
+        const padTop = parseFloat(getComputedStyle(scroller).paddingTop || "0");
+        scroller.scrollTop = Math.max(0, msgEl.offsetTop - padTop - 1);
+    };
+
+    useEffect(() => {
+        if (!pendingScrollId) return;
+        const scroller = chatRef.current;
+        if (!scroller) return;
+        requestAnimationFrame(() => {
+            const target = document.getElementById(pendingScrollId) as HTMLElement | null;
+            if (!target) return;
+            snapMessageToTop(target);
+            setPendingScrollId(null);
+            recomputeBottomState();
+        });
+    }, [messages.length, pendingScrollId, recomputeBottomState]);
+
+    const handleSend = (text: string, kbdDir: Dir) => {
+        if (streaming) return;
+
+        setLastSources(null);
+        setLastTools([]);
+
+        const userIdx = messages.length;
+        const userMsg: Msg = { role: "user", content: text, dir: kbdDir };
+        const assistantMsg: Msg = { role: "assistant", content: "", dir: kbdDir };
+
+        setMessages((prev) => [...prev, userMsg, assistantMsg]);
+        setPendingScrollId(`msg-${userIdx}`);
+        setStreaming(true);
+
+        esRef.current = openChatSSE(
+            text,
+            {
+                onToken: (t) => {
+                    setMessages((prev) => {
+                        const next = [...prev];
+                        const lastIdx = next.length - 1;
+                        if (lastIdx >= 0 && next[lastIdx].role === "assistant") {
+                            const combined = next[lastIdx].content + t;
+                            const dir: Dir = looksLikeCode(combined) ? "ltr" : detectDir(combined);
+                            next[lastIdx] = { ...next[lastIdx], content: combined, dir };
+                        }
+                        return next;
+                    });
+                },
+                onSources: (arr) => { setLastSources(arr); },
+                onTool: (ev) => { setLastTools((prev) => [...prev, ev]); },
+                onDone: () => setStreaming(false),
+                onError: (msg) => {
+                    setStreaming(false);
+                    setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: `×©×’×™××ª ×¡×˜×¨×™×ž×™× ×’: ${msg}`, dir: "rtl" },
+                    ]);
+                },
+            },
+            { mode: ragMode }
+        );
+    };
+
+    useEffect(() => () => { if (esRef.current) esRef.current.close(); }, []);
+
+    const jumpToBottom = () => {
+        const el = chatRef.current;
+        if (!el) return;
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    };
+
+    return (
+        <div style={{ minHeight: "100vh", display: "grid", gridTemplateRows: "auto 1fr" }}>
+            <Header
+                ref={headerRef}
+                backendStatus={backendStatus}
+                ragMode={ragMode}
+                onChangeMode={setRagMode}
+            />
+
+            <div ref={viewportRef} className="chat-viewport">
+                <div ref={chatRef} className="container chat">
+                    {messages.map((m, idx) => (
+                        <ChatMessage key={idx} id={`msg-${idx}`} role={m.role} content={m.content} />
+                    ))}
+                    {lastTools.length > 0 && <ToolCalls items={lastTools} />}
+                    {lastSources && lastSources.length > 0 && <SourcesBar items={lastSources} />}
+                </div>
+            </div>
+
+            {showJumpDown && (
+                <button
+                    className="jump-down"
+                    onClick={jumpToBottom}
+                    aria-label="×œ×§×¤×•×¥ ×œ×ª×’×•×‘×” ×”×¢×“×›× ×™×ª"
+                    style={{ bottom: jumpBtnBottom }}
+                >
+                    â†“
+                </button>
+            )}
+
+            <Composer disabled={streaming} onSend={handleSend} onHeightChange={onComposerHeight} />
+        </div>
+    );
+}
+
+### FILE: src\main.tsx ###
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./styles.css";
+
+// Initial default: RTL (Hebrew-first)
+document.documentElement.setAttribute("dir", "rtl");
+document.documentElement.setAttribute("lang", "he");
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+    <React.StrictMode>
+        <App />
+    </React.StrictMode>
+);
+
+### FILE: src\styles.css ###
+
+:root {
+    --bg: #ffffff;
+    --text: #111827;
+    --text-strong: #0b0f19;
+    --panel: #f6f8fa;
+    --user: #e8f0fe;
+    --border: #e5e7eb;
+    --code-bg: #0f172a0f;
+    --shadow: 0 6px 24px rgba(0,0,0,.08), 0 2px 6px rgba(0,0,0,.06);
+    --scroll-track: #f0f2f5;
+    --scroll-thumb: #cbd5e1;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0b0f19;
+        --text: #e5e7eb;
+        --text-strong: #f3f4f6;
+        --panel: #0f172a;
+        --user: #1f2937;
+        --border: #374151;
+        --code-bg: #111827;
+        --shadow: 0 6px 24px rgba(0,0,0,.4), 0 2px 6px rgba(0,0,0,.3);
+        --scroll-track: #0e1424;
+        --scroll-thumb: #374151;
+    }
+}
+
+* { box-sizing: border-box; }
+html, body, #root {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
+}
+
+.container { max-width: min(1200px, 96vw); margin: 0 auto; }
+
+/* Header */
+.header { background: var(--panel); border-bottom: 1px solid var(--border); }
+
+/* Fixed chat viewport between header & composer */
+.chat-viewport {
+    position: fixed;
+    left: 0; right: 0;
+    /* top/bottom set inline by App.tsx */
+    overflow: hidden;
+    z-index: 0;
+}
+
+/* Inner scroller that actually scrolls */
+.chat {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;             /* right-align all messages */
+    gap: 12px;
+    padding: 16px;
+    overflow-y: auto;
+    height: 100%;
+    padding-bottom: 16px;              /* space above composer */
+    direction: ltr;                    /* keep scrollbar on the RIGHT in RTL locales */
+    scroll-snap-type: y mandatory;
+    scrollbar-gutter: stable;
+}
+
+/* Modern scrollbar styling */
+.chat { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+.chat::-webkit-scrollbar { width: 10px; }
+.chat::-webkit-scrollbar-track { background: var(--scroll-track); border-radius: 8px; }
+.chat::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 8px; }
+.chat::-webkit-scrollbar-thumb:hover { filter: brightness(0.95); }
+
+/* ---- MESSAGE BLOCKS (bidi-robust) ---- */
+.msg {
+    scroll-snap-align: start;
+    scroll-margin-top: 1px;          /* ensure previous item fully out of view */
+    text-align: start;               /* follows dir (rtl => right, ltr => left) */
+}
+
+/* Force per-message bidi independent of container */
+.msg[dir="rtl"] {
+    direction: rtl;
+    unicode-bidi: plaintext;
+}
+.msg[dir="ltr"] {
+    direction: ltr;
+    unicode-bidi: plaintext;
+}
+
+/* User bubble */
+.bubble {
+    color: var(--text-strong);
+    font-weight: 600;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 12px;
+    max-width: 80ch;
+    white-space: pre-wrap;
+    line-height: 1.55;
+    margin-left: auto;
+}
+.bubble-user { background: var(--user); }
+
+/* Assistant text (no bubble) */
+.assistant {
+    color: var(--text-strong);
+    font-weight: 500;
+    max-width: 80ch;
+    white-space: pre-wrap;
+    line-height: 1.6;
+    margin-left: auto;
+}
+
+/* Fixed composer */
+.footer-fixed {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    z-index: 40;
+    box-shadow: 0 -2px 10px rgba(0,0,0,0.06);
+}
+
+/* Input/Button */
+.input {
+    flex: 1;
+    font-size: 16px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text-strong);
+    font-weight: 600;
+}
+.input::placeholder { opacity: .85; }
+
+.textarea {
+    resize: none;
+    overflow: hidden;    /* we auto-resize with JS */
+    line-height: 1.5;
+    max-height: 30vh;    /* safe cap */
+}
+
+.button {
+    font-size: 16px;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: #111827;
+    color: white;
+    cursor: pointer;
+    box-shadow: var(--shadow);
+    height: 44px;        /* keep constant size */
+    align-self: flex-end;/* don't stretch with textarea */
+}
+.button[disabled] { background: #2d2d2d20; color: #6b7280; cursor: not-allowed; }
+
+/* Code blocks are always LTR */
+pre, code {
+    direction: ltr;
+    unicode-bidi: plaintext;
+    background: var(--code-bg);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-size: 0.95em;
+}
+pre { padding: 10px 12px; border-radius: 10px; overflow-x: auto; border: 1px solid var(--border); }
+
+/* Floating â€œjump to latestâ€ */
+.jump-down {
+    position: fixed;
+    right: 24px;
+    /* bottom set inline by App.tsx so it sits above composer */
+    width: 44px;
+    height: 44px;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text-strong);
+    box-shadow: var(--shadow);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    z-index: 45;
+}
+.jump-down:hover { filter: brightness(0.97); }
+
+### FILE: src\vite-env.d.ts ###
+
+/// <reference types="vite/client" />

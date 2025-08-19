@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { openChatSSE, type RagMode } from "./lib/sse";
+import { openChatSSE, type RagMode, type Source, type ToolEvent } from "./lib/sse";
 import Header from "./components/Header";
 import ChatMessage from "./components/ChatMessage";
 import Composer from "./components/Composer";
 import SourcesBar from "./components/SourcesBar";
 import ToolCalls from "./components/ToolCalls";
+import TracesBar from "./components/TracesBar";
 import { type Dir, detectDir, looksLikeCode } from "./lib/text";
 
 type Msg = { role: "user" | "assistant"; content: string; dir: Dir };
-type Source = { id: number; source: string; preview: string; score: number };
-type ToolEvent = { name: string; args?: Record<string, never>; result?: never; error?: string };
 
 export default function App() {
     const [backendStatus, setBackendStatus] = useState<string>("checking...");
@@ -19,6 +18,7 @@ export default function App() {
 
     const [lastSources, setLastSources] = useState<Source[] | null>(null);
     const [lastTools, setLastTools] = useState<ToolEvent[]>([]);
+    const [lastTraceId, setLastTraceId] = useState<string | null>(null);
 
     const headerRef = useRef<HTMLElement | null>(null);
     const composerH = useRef<number>(96);
@@ -81,9 +81,7 @@ export default function App() {
         return () => el.removeEventListener("scroll", onScroll);
     }, [recomputeBottomState]);
 
-    useEffect(() => {
-        recomputeBottomState();
-    }, [messages, recomputeBottomState]);
+    useEffect(() => { recomputeBottomState(); }, [messages, recomputeBottomState]);
 
     useEffect(() => {
         const el = chatRef.current;
@@ -118,6 +116,7 @@ export default function App() {
 
         setLastSources(null);
         setLastTools([]);
+        setLastTraceId(null);
 
         const userIdx = messages.length;
         const userMsg: Msg = { role: "user", content: text, dir: kbdDir };
@@ -144,6 +143,7 @@ export default function App() {
                 },
                 onSources: (arr) => { setLastSources(arr); },
                 onTool: (ev) => { setLastTools((prev) => [...prev, ev]); },
+                onTrace: (id) => { setLastTraceId(id); },
                 onDone: () => setStreaming(false),
                 onError: (msg) => {
                     setStreaming(false);
@@ -179,7 +179,8 @@ export default function App() {
                     {messages.map((m, idx) => (
                         <ChatMessage key={idx} id={`msg-${idx}`} role={m.role} content={m.content} />
                     ))}
-                    {/* Day-6 panel: tool calls (if any), then citations (if any) */}
+                    {/* NEW: quick trace badge */}
+                    <TracesBar traceId={lastTraceId} />
                     {lastTools.length > 0 && <ToolCalls items={lastTools} />}
                     {lastSources && lastSources.length > 0 && <SourcesBar items={lastSources} />}
                 </div>
