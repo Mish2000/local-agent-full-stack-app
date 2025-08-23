@@ -13,6 +13,9 @@ from tracing import Tracer
 from memory import memory
 from eval.ragas_eval import run_evaluation, get_last_summary
 
+from db import init_db, Base
+from auth import router as auth_router
+
 import httpx
 
 # ---------------------- Minimal .env loader (no extra dependency) ----------------------
@@ -48,6 +51,24 @@ from tools.web_search import WebSearcher
 from tools.py_eval import run_python
 
 app = FastAPI()
+
+# --- CORS (allow cookies from frontend) ---
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Routers ---
+app.include_router(auth_router)
+
+@app.on_event("startup")
+async def _on_startup():
+    await init_db(Base)
+
 tracer = Tracer()
 
 origins = ["http://localhost:5173", "http://127.0.0.1:5173"]

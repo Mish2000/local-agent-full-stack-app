@@ -1,3 +1,4 @@
+// src/components/ui/select.tsx
 import * as React from "react";
 import * as SelectPrimitive from "@radix-ui/react-select";
 import { ChevronDown, Check } from "lucide-react";
@@ -31,9 +32,9 @@ export function SelectTrigger({
 }
 
 export const SelectContent = React.forwardRef<
-    React.ElementRef<typeof SelectPrimitive.Content>,
+    React.ComponentRef<typeof SelectPrimitive.Content>,
     React.ComponentPropsWithoutRef<typeof SelectPrimitive.Content>
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
 >(({ className, children, ...props }, ref) => (
     <SelectPrimitive.Portal>
         <SelectPrimitive.Content
@@ -44,16 +45,18 @@ export const SelectContent = React.forwardRef<
             ].join(" ")}
             {...props}
         >
-            <SelectPrimitive.Viewport className="p-1 text-[var(--text-strong)]">{children}</SelectPrimitive.Viewport>
+            <SelectPrimitive.Viewport className="p-1 text-[var(--text-strong)]">
+                {children}
+            </SelectPrimitive.Viewport>
         </SelectPrimitive.Content>
     </SelectPrimitive.Portal>
 ));
 SelectContent.displayName = "SelectContent";
 
 export const SelectItem = React.forwardRef<
-    React.ElementRef<typeof SelectPrimitive.Item>,
+    React.ComponentRef<typeof SelectPrimitive.Item>,
     React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
 >(({ className, children, ...props }, ref) => (
     <SelectPrimitive.Item
         ref={ref}

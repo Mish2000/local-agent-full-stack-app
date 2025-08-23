@@ -1,4 +1,4 @@
-// src/App.tsx
+// src/routes/Chat.tsx
 import { useCallback, useEffect, useRef, useState } from "react";
 import { openChatSSE, type RagMode, type Source, type ToolEvent } from "@/lib/sse";
 import Header from "@/components/Header";
@@ -12,6 +12,7 @@ import { ArrowDown } from "lucide-react";
 import { toast } from "sonner";
 
 type Msg = { role: "user" | "assistant"; content: string; dir: Dir };
+type Variant = "guest" | "full";
 
 function makeCid(): string {
     if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -20,18 +21,26 @@ function makeCid(): string {
     return Math.random().toString(36).slice(2, 10);
 }
 
-export default function App() {
+export default function Chat({ variant = "full" }: { variant?: Variant }) {
+    const isGuest = variant === "guest";
+
     const [backendStatus, setBackendStatus] = useState<string>("checking...");
     const [messages, setMessages] = useState<Msg[]>([]);
     const [streaming, setStreaming] = useState(false);
-    const [ragMode, setRagMode] = useState<RagMode>("auto");
+
+    // In guest, we force No Tools; in full we start with "auto".
+    const forcedMode: RagMode | null = isGuest ? "none" : null;
+    const [ragMode, setRagMode] = useState<RagMode>(forcedMode ?? "auto");
 
     const [lastSources, setLastSources] = useState<Source[] | null>(null);
     const [lastTools, setLastTools] = useState<ToolEvent[]>([]);
     const [lastTraceId, setLastTraceId] = useState<string | null>(null);
 
-    // persistent conversation id
+    // Conversation id:
+    // - guest: NOT persisted (new on every refresh)
+    // - full : persisted in localStorage
     const [cid, setCid] = useState<string>(() => {
+        if (isGuest) return makeCid();
         const k = "chat_cid";
         const existing = localStorage.getItem(k);
         if (existing) return existing;
@@ -101,7 +110,9 @@ export default function App() {
         return () => el.removeEventListener("scroll", onScroll);
     }, [recomputeBottomState]);
 
-    useEffect(() => { recomputeBottomState(); }, [messages, recomputeBottomState]);
+    useEffect(() => {
+        recomputeBottomState();
+    }, [messages, recomputeBottomState]);
 
     useEffect(() => {
         const el = chatRef.current;
@@ -161,20 +172,27 @@ export default function App() {
                         return next;
                     });
                 },
-                onSources: (arr) => { setLastSources(arr); },
-                onTool: (ev) => { setLastTools((prev) => [...prev, ev]); },
-                onTrace: (id) => { setLastTraceId(id); },
+                onSources: (arr) => setLastSources(arr),
+                onTool: (ev) => setLastTools((prev) => [...prev, ev]),
+                onTrace: (id) => setLastTraceId(id),
                 onDone: () => setStreaming(false),
                 onError: (msg) => {
                     setStreaming(false);
                     toast.error(`שגיאת סטרימינג: ${msg}`);
                 },
             },
-            { mode: ragMode, cid }
+            {
+                mode: forcedMode ?? ragMode,
+                cid,
+            }
         );
     };
 
-    useEffect(() => () => { if (esRef.current) esRef.current.close(); }, []);
+    useEffect(() => {
+        return () => {
+            if (esRef.current) esRef.current.close();
+        };
+    }, []);
 
     const jumpToBottom = () => {
         const el = chatRef.current;
@@ -182,17 +200,38 @@ export default function App() {
         el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     };
 
-    const newChat = async () => {
+    const clearBackendCid = async (id: string) => {
         try {
-            await fetch(`http://localhost:8000/chat/clear?cid=${encodeURIComponent(cid)}`, { method: "POST" });
-        } catch { /* empty */ }
-        const fresh = makeCid();
-        setCid(fresh);
-        localStorage.setItem("chat_cid", fresh);
+            await fetch(`http://localhost:8000/chat/clear?cid=${encodeURIComponent(id)}`, { method: "POST" });
+        } catch {
+            /* ignore */
+        }
+    };
+
+    const newChat = async () => {
+        if (isGuest) {
+            setCid(makeCid());
+        } else {
+            await clearBackendCid(cid);
+            const fresh = makeCid();
+            setCid(fresh);
+            localStorage.setItem("chat_cid", fresh);
+        }
         setMessages([]);
         setLastSources(null);
         setLastTools([]);
         setLastTraceId(null);
+    };
+
+    // If user clicks Login/Register in header while in guest mode, clear guest memory immediately.
+    const onAuthNavigate = async () => {
+        if (isGuest && cid) {
+            await clearBackendCid(cid);
+            setMessages([]);
+            setLastSources(null);
+            setLastTools([]);
+            setLastTraceId(null);
+        }
     };
 
     return (
@@ -200,12 +239,14 @@ export default function App() {
             <Header
                 ref={headerRef}
                 backendStatus={backendStatus}
-                ragMode={ragMode}
+                ragMode={forcedMode ?? ragMode}
                 onChangeMode={setRagMode}
                 onNewChat={newChat}
+                showModePicker={!isGuest}
+                onAuthNav={onAuthNavigate}
             />
 
-            {/* Fixed viewport between header & composer (sizes computed inline) */}
+            {/* Fixed viewport between header & composer */}
             <div ref={viewportRef} className="chat-viewport">
                 <div ref={chatRef} className="container chat">
                     {messages.map((m, idx) => (

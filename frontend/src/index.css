@@ -58,7 +58,7 @@ html, body, #root {
 .chat-viewport {
     position: fixed;
     left: 0; right: 0;
-    /* top/bottom set inline by App.tsx */
+    /* top/bottom set inline by Chat.tsx */
     overflow: hidden;
     z-index: 0;
 }
@@ -72,7 +72,6 @@ html, body, #root {
     padding: 16px;
     overflow-y: auto;
     height: 100%;
-    padding-bottom: 16px;    /* space above composer */
     direction: ltr;          /* keep scrollbar on the RIGHT in RTL locales */
     scroll-snap-type: y mandatory;
     scrollbar-gutter: stable;
@@ -184,7 +183,7 @@ pre { padding: 10px 12px; border-radius: 10px; overflow-x: auto; border: 1px sol
 .jump-down {
     position: fixed;
     right: 24px;
-    /* bottom set inline by App.tsx so it sits above composer */
+    /* bottom set inline by Chat.tsx so it sits above composer */
     width: 44px;
     height: 44px;
     border-radius: 9999px;
