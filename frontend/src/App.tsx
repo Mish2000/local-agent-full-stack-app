@@ -1,14 +1,24 @@
+// src/App.tsx
 import { useCallback, useEffect, useRef, useState } from "react";
-import { openChatSSE, type RagMode, type Source, type ToolEvent } from "./lib/sse";
-import Header from "./components/Header";
-import ChatMessage from "./components/ChatMessage";
-import Composer from "./components/Composer";
-import SourcesBar from "./components/SourcesBar";
-import ToolCalls from "./components/ToolCalls";
-import TracesBar from "./components/TracesBar";
-import { type Dir, detectDir, looksLikeCode } from "./lib/text";
+import { openChatSSE, type RagMode, type Source, type ToolEvent } from "@/lib/sse";
+import Header from "@/components/Header";
+import ChatMessage from "@/components/ChatMessage";
+import Composer from "@/components/Composer";
+import SourcesBar from "@/components/SourcesBar";
+import ToolCalls from "@/components/ToolCalls";
+import TracesBar from "@/components/TracesBar";
+import { type Dir, detectDir, looksLikeCode } from "@/lib/text";
+import { ArrowDown } from "lucide-react";
+import { toast } from "sonner";
 
 type Msg = { role: "user" | "assistant"; content: string; dir: Dir };
+
+function makeCid(): string {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+        return (crypto as Crypto).randomUUID();
+    }
+    return Math.random().toString(36).slice(2, 10);
+}
 
 export default function App() {
     const [backendStatus, setBackendStatus] = useState<string>("checking...");
@@ -19,6 +29,16 @@ export default function App() {
     const [lastSources, setLastSources] = useState<Source[] | null>(null);
     const [lastTools, setLastTools] = useState<ToolEvent[]>([]);
     const [lastTraceId, setLastTraceId] = useState<string | null>(null);
+
+    // persistent conversation id
+    const [cid, setCid] = useState<string>(() => {
+        const k = "chat_cid";
+        const existing = localStorage.getItem(k);
+        if (existing) return existing;
+        const fresh = makeCid();
+        localStorage.setItem(k, fresh);
+        return fresh;
+    });
 
     const headerRef = useRef<HTMLElement | null>(null);
     const composerH = useRef<number>(96);
@@ -147,13 +167,10 @@ export default function App() {
                 onDone: () => setStreaming(false),
                 onError: (msg) => {
                     setStreaming(false);
-                    setMessages((prev) => [
-                        ...prev,
-                        { role: "assistant", content: `שגיאת סטרימינג: ${msg}`, dir: "rtl" },
-                    ]);
+                    toast.error(`שגיאת סטרימינג: ${msg}`);
                 },
             },
-            { mode: ragMode }
+            { mode: ragMode, cid }
         );
     };
 
@@ -165,38 +182,55 @@ export default function App() {
         el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     };
 
+    const newChat = async () => {
+        try {
+            await fetch(`http://localhost:8000/chat/clear?cid=${encodeURIComponent(cid)}`, { method: "POST" });
+        } catch { /* empty */ }
+        const fresh = makeCid();
+        setCid(fresh);
+        localStorage.setItem("chat_cid", fresh);
+        setMessages([]);
+        setLastSources(null);
+        setLastTools([]);
+        setLastTraceId(null);
+    };
+
     return (
-        <div style={{ minHeight: "100vh", display: "grid", gridTemplateRows: "auto 1fr" }}>
+        <div className="min-h-dvh">
             <Header
                 ref={headerRef}
                 backendStatus={backendStatus}
                 ragMode={ragMode}
                 onChangeMode={setRagMode}
+                onNewChat={newChat}
             />
 
+            {/* Fixed viewport between header & composer (sizes computed inline) */}
             <div ref={viewportRef} className="chat-viewport">
                 <div ref={chatRef} className="container chat">
                     {messages.map((m, idx) => (
                         <ChatMessage key={idx} id={`msg-${idx}`} role={m.role} content={m.content} />
                     ))}
-                    {/* NEW: quick trace badge */}
                     <TracesBar traceId={lastTraceId} />
                     {lastTools.length > 0 && <ToolCalls items={lastTools} />}
                     {lastSources && lastSources.length > 0 && <SourcesBar items={lastSources} />}
                 </div>
             </div>
 
+            {/* Jump-to-bottom floating button */}
             {showJumpDown && (
                 <button
                     className="jump-down"
                     onClick={jumpToBottom}
                     aria-label="לקפוץ לתגובה העדכנית"
                     style={{ bottom: jumpBtnBottom }}
+                    title="לתחתית"
                 >
-                    ↓
+                    <ArrowDown className="size-5" />
                 </button>
             )}
 
+            {/* Fixed composer */}
             <Composer disabled={streaming} onSend={handleSend} onHeightChange={onComposerHeight} />
         </div>
     );

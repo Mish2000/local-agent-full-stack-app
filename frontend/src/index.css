@@ -1,3 +1,6 @@
+@import "tailwindcss";
+
+/* === Your original design system (unchanged) === */
 :root {
     --bg: #ffffff;
     --text: #111827;
@@ -9,6 +12,7 @@
     --shadow: 0 6px 24px rgba(0,0,0,.08), 0 2px 6px rgba(0,0,0,.06);
     --scroll-track: #f0f2f5;
     --scroll-thumb: #cbd5e1;
+    color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -23,7 +27,14 @@
         --shadow: 0 6px 24px rgba(0,0,0,.4), 0 2px 6px rgba(0,0,0,.3);
         --scroll-track: #0e1424;
         --scroll-thumb: #374151;
+        color-scheme: dark;
     }
+}
+
+/* Native selects (Radix Select is separate) */
+select, option {
+    background: var(--panel);
+    color: var(--text-strong);
 }
 
 * { box-sizing: border-box; }
@@ -38,7 +49,10 @@ html, body, #root {
 .container { max-width: min(1200px, 96vw); margin: 0 auto; }
 
 /* Header */
-.header { background: var(--panel); border-bottom: 1px solid var(--border); }
+.header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+}
 
 /* Fixed chat viewport between header & composer */
 .chat-viewport {
@@ -53,13 +67,13 @@ html, body, #root {
 .chat {
     display: flex;
     flex-direction: column;
-    align-items: flex-end;             /* right-align all messages */
+    align-items: flex-end;   /* right-align all messages */
     gap: 12px;
     padding: 16px;
     overflow-y: auto;
     height: 100%;
-    padding-bottom: 16px;              /* space above composer */
-    direction: ltr;                    /* keep scrollbar on the RIGHT in RTL locales */
+    padding-bottom: 16px;    /* space above composer */
+    direction: ltr;          /* keep scrollbar on the RIGHT in RTL locales */
     scroll-snap-type: y mandatory;
     scrollbar-gutter: stable;
 }
@@ -74,8 +88,8 @@ html, body, #root {
 /* ---- MESSAGE BLOCKS (bidi-robust) ---- */
 .msg {
     scroll-snap-align: start;
-    scroll-margin-top: 1px;          /* ensure previous item fully out of view */
-    text-align: start;               /* follows dir (rtl => right, ltr => left) */
+    scroll-margin-top: 1px;  /* ensure previous item fully out of view */
+    text-align: start;       /* follows dir (rtl => right, ltr => left) */
 }
 
 /* Force per-message bidi independent of container */
@@ -122,7 +136,7 @@ html, body, #root {
     box-shadow: 0 -2px 10px rgba(0,0,0,0.06);
 }
 
-/* Input/Button */
+/* Input/Button (legacy helpers still used) */
 .input {
     flex: 1;
     font-size: 16px;
