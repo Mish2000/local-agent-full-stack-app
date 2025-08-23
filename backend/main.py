@@ -6,19 +6,42 @@ from typing import AsyncGenerator, List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 from rag.retriever import Retriever
 from tracing import Tracer
-
-# --------- Settings ---------
-BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
-MODEL_NAME = os.getenv("MODEL_NAME", "aya-expanse:8b")
-CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+from memory import memory
+from eval.ragas_eval import run_evaluation, get_last_summary
 
 import httpx
+
+# ---------------------- Minimal .env loader (no extra dependency) ----------------------
+def _load_env_file(path: str) -> None:
+    """Best-effort .env parser. Does not override existing environment variables."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                os.environ.setdefault(k, v)
+    except FileNotFoundError:
+        pass
+
+# Load backend/.env if present
+_load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
+
+# --------- Settings (env-driven) ---------
+BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
+MODEL_NAME = os.getenv("MODEL_NAME", "aya-expanse:8b")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+HISTORY_CHAR_BUDGET = int(os.getenv("HISTORY_CHAR_BUDGET", "3500"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "0"))
 
 # Tools
 from tools.web_search import WebSearcher
@@ -119,7 +142,10 @@ async def ollama_stream(prompt: str) -> AsyncGenerator[str, None]:
             yield f"ERROR: {err}"
             return
         url = f"{OLLAMA_HOST}/api/generate"
-        payload = {"model": MODEL_NAME, "prompt": prompt, "stream": True}
+        payload: Dict[str, object] = {"model": MODEL_NAME, "prompt": prompt, "stream": True}
+        # <<< NEW: optionally set num_ctx if provided
+        if OLLAMA_NUM_CTX and OLLAMA_NUM_CTX > 0:
+            payload["options"] = {"num_ctx": int(OLLAMA_NUM_CTX)}
         try:
             async with client.stream("POST", url, json=payload) as resp:
                 if resp.status_code != 200:
@@ -252,13 +278,36 @@ async def web_test(q: str = Query(..., description="Query")):
         "items": items,
     }
 
-# Quick py_eval test
 @app.get("/tools/py/test")
 async def py_test():
     res = await run_python("print(sum(i*i for i in range(1, 11)))")
     return res
 
-# ---------------------- Guardrails in system prompt ----------------------
+# ---------------------- RAG Evaluation ----------------------
+@app.get("/eval/ragas/run")
+async def eval_ragas_run(limit: int = Query(25, ge=1, le=200)):
+    """
+    Generate ~limit auto Q&A from your indexed corpus, answer with your pipeline,
+    and compute RAGAS scores when available. Writes CSV/JSON (and PNG if possible)
+    into backend/logs/ragas/.
+    """
+    try:
+        summary = await run_evaluation(limit=limit)
+        return JSONResponse(summary)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/eval/ragas/last")
+def eval_ragas_last():
+    """
+    Return the summary JSON of the last evaluation run (backend/logs/ragas/latest.json).
+    """
+    try:
+        return JSONResponse(get_last_summary())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ---------------------- Guardrails & Prompt builders (history-aware) ----------------------
 def _base_system_prompt(lang: str, strict: bool = False, mode: str = "general", timed_out_note: Optional[str] = None) -> str:
     if strict:
         policy = (
@@ -280,52 +329,43 @@ def _base_system_prompt(lang: str, strict: bool = False, mode: str = "general", 
     timeout_note = f" Note: {timed_out_note}" if timed_out_note else ""
     return f"You are a helpful assistant. Always answer in {lang}. {policy}{web_note}{tools_rules}{timeout_note}"
 
-def build_prompt_single(user_query: str, context_text: str, *, lang: str, strict: bool, mode: str, timed_out_note: Optional[str] = None) -> str:
+def build_prompt_single(
+    user_query: str,
+    context_text: str,
+    *,
+    lang: str,
+    strict: bool,
+    mode: str,
+    timed_out_note: Optional[str] = None,
+    history_text: str = "",
+) -> str:
     sys = _base_system_prompt(lang, strict=strict, mode=mode, timed_out_note=timed_out_note)
-    return f"{sys}\n\n# Context:\n{context_text}\n\n# Question:\n{user_query}\n\n# Answer:"
+    convo = f"\n# Conversation so far:\n{history_text}\n" if history_text else ""
+    ctx = f"\n# Context:\n{context_text}\n" if context_text else "\n# Context:\n(none)\n"
+    return f"{sys}{convo}{ctx}\n# Question:\n{user_query}\n\n# Answer:"
 
-def build_prompt_mixed(user_query: str, ctx_rag: str, ctx_web: str, *, lang: str) -> str:
+def build_prompt_mixed(
+    user_query: str,
+    ctx_rag: str,
+    ctx_web: str,
+    *,
+    lang: str,
+    history_text: str = "",
+) -> str:
     sys = (
         f"You are a helpful assistant. Always answer in {lang}. "
         f"Consider TWO context sections: (A) Local documents and (B) Web articles. "
         f"Decide relevance: prefer (B) for breaking news/current facts; prefer (A) when the ask references an uploaded file, example, lines, or internal docs. "
         f"If both are relevant, synthesize. If neither is relevant, say so briefly. Be concise and avoid hallucinations."
     )
+    convo = f"\n# Conversation so far:\n{history_text}\n" if history_text else ""
     return (
-        f"{sys}\n\n# Context A — Local (may be partial):\n{ctx_rag}\n\n"
+        f"{sys}{convo}\n# Context A — Local (may be partial):\n{ctx_rag}\n\n"
         f"# Context B — Web (may be partial):\n{ctx_web}\n\n"
         f"# Question:\n{user_query}\n\n# Answer:"
     )
 
-# ---------------------- Python code fence detector (robust) ----------------------
-_CODE_PATTERNS = [
-    re.compile(r"```(?:python|py)\s*\r?\n(.*?)\r?\n```", re.IGNORECASE | re.DOTALL),
-    re.compile(r"```(?:python|py)\s*\r?\n([\s\S]*)\Z", re.IGNORECASE),
-    re.compile(r"```\s*\r?\n(.*?)\r?\n```", re.DOTALL),
-    re.compile(r"```\s*\r?\n([\s\S]*)\Z"),
-    re.compile(r"```(.*?)```", re.DOTALL),
-]
-
-_PY_LINE_SIG = re.compile(
-    r"(?m)^\s*(?:"
-    r"import\s+\w+|"
-    r"from\s+\w[\w\.]*\s+import\s+\w+|"
-    r"def\s+\w+\s*\(|"
-    r"class\s+\w+\s*:|"
-    r"print\s*\(|"
-    r"for\s+\w+\s+in\s+|"
-    r"while\s+|"
-    r"if\s+.*:|"
-    r"with\s+|"
-    r"async\s+def\s+\w+\s*\(|"
-    r"lambda\s+|"
-    r"try\s*:|"
-    r"except\s+|"
-    r"@\w+"
-    r")"
-)
-
-# ------------ Code detection helpers ------------
+# ---------------------- Code detection & web-query sanitization ----------------------
 _PY_FENCE_RE = re.compile(r"```(?:python)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
 _PY_LINE_SIG = re.compile(
     r"""(?mx)
@@ -334,84 +374,73 @@ _PY_LINE_SIG = re.compile(
 )
 
 def _extract_python_code(text: str) -> Optional[str]:
-    """
-    Returns Python code if the user pasted code (with or without fences), else None.
-    Preference order:
-      1) fenced ```python ... ```
-      2) any fenced ``` ... ```
-      3) unfenced, but looks like code by common line signatures
-    """
     if not text:
         return None
     m = _PY_FENCE_RE.search(text)
     if m:
         code = (m.group(1) or "").strip()
         return code or None
-
-    # Any generic fenced region (drop the fence markers)
     m2 = re.search(r"```([\s\S]*?)```", text)
     if m2:
         code = (m2.group(1) or "").strip()
         return code or None
-
-    # Unfenced but starts/contains typical Python lines
     if _PY_LINE_SIG.search(text):
         return text.strip()
-
     return None
 
-
-# ---------------------- Sanitization for web tool ----------------------
 def _sanitize_web_query(text: str) -> str:
-    """Remove code fences and obvious code; normalize spacing; cap length. Empty means 'don't search'."""
     if not text:
         return ""
-    # Drop fenced code completely
     s = re.sub(r"```[\s\S]*?```", " ", text)
-    # If the remaining string still looks like Python (no fences), treat as code => skip web
     if _PY_LINE_SIG.search(s):
         return ""
-    # Remove stray backticks and compress spaces
     s = s.replace("`", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s[:200]
 
-
 # ---------------------- API ----------------------
+@app.post("/chat/clear")
+async def chat_clear(cid: str = Query(..., min_length=1, max_length=64, pattern=r"^[\w\-]+$")):
+    memory.clear(cid)
+    return JSONResponse({"ok": True, "cleared": cid})
+
 @app.get("/chat/stream")
 async def chat_stream(
     q: str = Query(..., description="User query"),
-    mode: str = Query("auto", pattern="^(auto|none|dense|rerank|web)$")
+    mode: str = Query("auto", pattern="^(auto|none|dense|rerank|web)$"),
+    cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
 ):
     """
     Modes:
-      - auto   : Always probe local RAG; maybe web if heuristics or if RAG looks weak. Mix contexts smartly.
+      - auto   : Probe local RAG; maybe web if heuristics or weak RAG. Mix contexts smartly.
       - none   : no retrieval (pure LLM)
       - dense  : dense retrieval only (STRICT grounding)
       - rerank : dense + reranker (STRICT grounding)
-      - web    : ALWAYS run web search (with up to 60s budget). If none found, say so.
+      - web    : ALWAYS run web search (with up to 60s budget).
     """
     async def gen() -> AsyncGenerator[bytes, None]:
         try:
             lang = "Hebrew" if is_hebrew(q) else "English"
             used_tool = False
 
-            # ---- tracing (always) ----
+            # tracing
             trace_id = tracer.start_trace(q, mode)
             yield sse("trace", json.dumps({"id": trace_id}))
 
             citations_combined: List[Dict] = []
-            strict = False
             prompt = ""
-            resp_buf: List[str] = []  # accumulate streamed tokens for trace
+            resp_buf: List[str] = []
 
-            # ---- Run Python sandbox first when code is present (ALL modes) ----
+            # history (before appending current user turn)
+            history_text = memory.render(cid, lang=lang, max_chars=HISTORY_CHAR_BUDGET)
+            memory.append(cid, "user", q)
+
+            # Python sandbox path
             py_code = _extract_python_code(q)
             if py_code:
                 used_tool = True
                 res = await run_python(py_code, timeout_sec=5.0)
 
-                # Tool event (UI) + tracing
                 tool_payload = {
                     "name": "py_eval",
                     "args": {"language": "python", "timeout_s": 5},
@@ -420,7 +449,6 @@ async def chat_stream(
                 yield sse("tool", json.dumps(tool_payload, ensure_ascii=False))
                 tracer.log_tool(trace_id, "py_eval", {"language": "python", "timeout_s": 5}, res)
 
-                # Build assistant summary prompt over the program output
                 ctx_text = (
                     f"[Code]\n{py_code}\n\n"
                     f"[Program output]\n{res.get('stdout') or '(no stdout)'}\n\n"
@@ -433,6 +461,7 @@ async def chat_stream(
                     lang=lang,
                     strict=False,
                     mode="general",
+                    history_text=history_text,
                 )
                 async for tok in ollama_stream(prompt):
                     resp_buf.append(tok)
@@ -440,28 +469,25 @@ async def chat_stream(
                     await asyncio.sleep(0)
 
                 assistant_text = "".join(resp_buf)
+                memory.append(cid, "assistant", assistant_text)
                 tracer.end_trace(trace_id, prompt, assistant_text, citations=[], ok=True)
 
                 yield sse("sources", "[]")
                 yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
                 return
 
-            # ---------------------- Regular path (no code) ----------------------
-            # --- NONE ---
+            # Regular modes
             if mode == "none":
-                prompt = build_prompt_single(q, "", lang=lang, strict=False, mode="general")
+                prompt = build_prompt_single(q, "", lang=lang, strict=False, mode="general", history_text=history_text)
 
-            # --- DENSE / RERANK (STRICT) ---
             elif mode in ("dense", "rerank"):
                 retriever = Retriever(k_initial=12, k_final=RAG_TOP_K, use_reranker=(mode == "rerank"))
                 docs = retriever.retrieve(q)
                 ctx_rag = build_context(q, docs)
-                strict = True
-                prompt = build_prompt_single(q, ctx_rag["context_text"], lang=lang, strict=True, mode=mode)
+                prompt = build_prompt_single(q, ctx_rag["context_text"], lang=lang, strict=True, mode=mode, history_text=history_text)
                 citations_combined = ctx_rag["citations"]
                 used_tool = True
 
-                # UI + trace tool event
                 ev = {
                     "name": "retrieve_knowledge",
                     "args": {"query": q, "mode": mode},
@@ -470,20 +496,18 @@ async def chat_stream(
                 yield sse("tool", json.dumps(ev, ensure_ascii=False))
                 tracer.log_tool(trace_id, "retrieve_knowledge", {"query": q, "mode": mode}, ctx_rag["citations"])
 
-            # --- WEB (always search; up to 60s) ---
             elif mode == "web":
                 ws = WebSearcher()
                 sanitized = _sanitize_web_query(q)
-                items = []
+                items: List[Dict] = []
                 provider = "none"
-                debug = []
+                debug: List[str] = []
                 timed_out_note = None
 
                 if sanitized:
                     items, provider, debug, timed_out = await ws.search(sanitized, max_results=5, timeout=15.0, time_budget_sec=60.0)
                     if timed_out:
                         timed_out_note = "No web results were found within a 60-second search budget. Inform the user and suggest refining the query."
-                # UI + trace tool event
                 ev = {
                     "name": "web_search",
                     "args": {"query": sanitized or "(skipped due to code-like text)"},
@@ -497,20 +521,16 @@ async def chat_stream(
 
                 ctx_web = build_web_context(q, items)
                 citations_combined = ctx_web["citations"]
-
                 if items:
-                    prompt = build_prompt_single(q, ctx_web["context_text"], lang=lang, strict=False, mode="web")
+                    prompt = build_prompt_single(q, ctx_web["context_text"], lang=lang, strict=False, mode="web", history_text=history_text)
                 else:
-                    prompt = build_prompt_single(q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note)
+                    prompt = build_prompt_single(q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note, history_text=history_text)
 
-            # --- AUTO (probe RAG always; web if heuristics/weak RAG) ---
-            else:
-                # 1) RAG probe
+            else:  # auto
                 retriever = Retriever(k_initial=12, k_final=RAG_TOP_K, use_reranker=True)
                 rag_docs = retriever.retrieve(q)
                 ctx_rag = build_context(q, rag_docs)
 
-                # UI + trace probe event
                 ev_probe = {
                     "name": "retrieve_knowledge_probe",
                     "args": {"query": q},
@@ -521,7 +541,6 @@ async def chat_stream(
 
                 rag_used = len(rag_docs) > 0
 
-                # 2) Decide if we should also run web
                 run_web = _heuristic_wants_web(q)
                 rag_keywords = _extract_keywords(q)
                 rag_overlap = 0
@@ -534,13 +553,12 @@ async def chat_stream(
                 if run_web or not rag_strong:
                     ws = WebSearcher()
                     sanitized = _sanitize_web_query(q)
-                    items = []
+                    items: List[Dict] = []
                     provider = "none"
-                    debug = []
+                    debug: List[str] = []
                     timed_out = False
                     if sanitized:
                         items, provider, debug, timed_out = await ws.search(sanitized, max_results=5, timeout=15.0, time_budget_sec=20.0)
-                    # UI + trace
                     ev_web = {
                         "name": "web_search",
                         "args": {"query": sanitized or "(skipped due to code-like text)"},
@@ -552,8 +570,7 @@ async def chat_stream(
                     })
                     ctx_web = build_web_context(q, items)
 
-                # 3) Build mixed prompt
-                prompt = build_prompt_mixed(q, ctx_rag["context_text"], ctx_web["context_text"], lang=lang)
+                prompt = build_prompt_mixed(q, ctx_rag["context_text"], ctx_web["context_text"], lang=lang, history_text=history_text)
                 citations_combined = ctx_rag["citations"] + ctx_web["citations"]
                 used_tool = rag_used or (len(ctx_web["citations"]) > 0)
 
@@ -566,16 +583,14 @@ async def chat_stream(
             # Push sources bar
             yield sse("sources", json.dumps(citations_combined, ensure_ascii=False))
 
-            # End trace
             assistant_text = "".join(resp_buf)
+            memory.append(cid, "assistant", assistant_text)
             tracer.end_trace(trace_id, prompt, assistant_text, citations_combined, ok=True)
 
             yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
         except Exception as e:
-            # Stream error to user
             yield sse("token", f"ERROR: backend exception: {e}")
             yield sse("sources", "[]")
-            # Try to close trace as failed
             try:
                 assistant_text = "".join(resp_buf) if 'resp_buf' in locals() else ""
                 tracer.end_trace(trace_id, prompt if 'prompt' in locals() else "", assistant_text, [], ok=False)
@@ -589,4 +604,3 @@ async def chat_stream(
         "X-Accel-Buffering": "no",
     }
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
-
