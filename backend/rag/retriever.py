@@ -1,7 +1,10 @@
-import os
+# backend/rag/retriever.py
+from __future__ import annotations
+
 import logging
+import os
 import re
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 # Silence Chroma telemetry noise
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
@@ -19,9 +22,10 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
-COLLECTION = "docs"
+COLLECTION = os.getenv("CHROMA_COLLECTION", "docs")
 RERANKER_NAME = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
 
+# Minimal bilingual stopwords for light query normalization
 _HE_STOP = {
     "של","עם","על","לא","כן","אם","או","זה","זו","אלה","הוא","היא","הם","הן",
     "אני","אתה","את","אתם","אתן","אנחנו","וכו","כל","גם","אך","אך־","אבל","כדי",
@@ -30,14 +34,16 @@ _HE_STOP = {
 }
 _EN_STOP = {
     "the","a","an","and","or","but","if","so","to","of","in","on","for","by","with","as","at",
-    "is","are","was","were","be","been","being","it","this","that","these","those","from",
-    "i","you","he","she","we","they","them","his","her","their","our","your","my","me",
+    "is","are","was","were","be","been","being","that","this","these","those","it","its","from",
 }
 
 def _normalize_query(q: str) -> str:
-    q = q.strip().lower()
-    q = re.sub(r"[^\w\u0590-\u05FF\s]+", " ", q)
-    toks = [t for t in q.split() if t not in _EN_STOP and t not in _HE_STOP]
+    if not q:
+        return q
+    q = q.strip()
+    # Remove punctuation except word chars, whitespace and Hebrew range
+    q2 = re.sub(r"[^\w\u0590-\u05FF\s]+", " ", q)
+    toks = [t for t in q2.split() if t.lower() not in _EN_STOP and t not in _HE_STOP]
     return " ".join(toks) if toks else q
 
 class Retriever:
@@ -56,35 +62,42 @@ class Retriever:
         self.k_final = k_final
         self.use_reranker = use_reranker
 
-    def retrieve(self, query: str) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, where: Dict[str, str] | None = None) -> List[Dict[str, Any]]:
         q_norm = _normalize_query(query) or query
 
-        # Dense retrieve
         qvec = self.embedder.encode([q_norm], normalize_embeddings=True)[0].tolist()
+
+        where_clean = None
+        if where:
+            # Chroma expects scalar values; coerce to str
+            where_clean = {k: (str(v) if v is not None else v) for k, v in where.items()}
+
         res = self.coll.query(
             query_embeddings=[qvec],
             n_results=self.k_initial,
             include=["documents", "metadatas", "distances"],
+            where=where_clean,
         )
 
         candidates: List[Dict[str, Any]] = []
         if res and res.get("documents"):
-            for i, doc in enumerate(res["documents"][0]):
-                meta = res["metadatas"][0][i] or {}
-                dist = float(res["distances"][0][i])
+            docs = res["documents"][0]
+            metas = res["metadatas"][0]
+            dists = res["distances"][0]
+            for i in range(len(docs)):
+                meta = metas[i] or {}
                 candidates.append({
-                    "text": doc,
+                    "text": docs[i],
                     "source": meta.get("source"),
                     "chunk": meta.get("chunk"),
                     "start_line": int(meta.get("start_line") or 0),
                     "end_line": int(meta.get("end_line") or 0),
-                    "distance": dist,
+                    "distance": float(dists[i]),
                 })
 
         if not candidates:
             return []
 
-        # Rerank or distance sort
         if self.use_reranker and self.reranker is not None:
             pairs = [[query, c["text"]] for c in candidates]
             scores = self.reranker.predict(pairs)

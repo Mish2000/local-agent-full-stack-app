@@ -5,6 +5,7 @@ from typing import Optional
 from sqlalchemy import String, BigInteger, DateTime, ForeignKey, Text, Boolean, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from db import Base
+from sqlalchemy.orm import relationship
 
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -43,6 +44,8 @@ class Chat(Base):
     title: Mapped[str] = mapped_column(String(255), default="New chat", nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    messages: Mapped[list["ChatMessage"]] = relationship(backref="chat", cascade="all, delete-orphan")
+
 
 class ChatMessage(Base):
     __tablename__ = "chat_messages"

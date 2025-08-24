@@ -14,9 +14,13 @@ export default function ToolCalls({ items }: { items: ToolEvent[] }) {
                                 <b>name:</b> {t.name}
                             </CardHeader>
                             <CardContent className="text-[13px]">
-                                {t.args && <pre className="whitespace-pre-wrap">{JSON.stringify(t.args, null, 2)}</pre>}
-                                {t.error && <div className="text-red-500 mt-2">Error: {t.error}</div>}
-                                {t.result && <pre className="whitespace-pre-wrap mt-2">{JSON.stringify(t.result, null, 2)}</pre>}
+                                {t.args != null && (
+                                    <pre className="whitespace-pre-wrap">{JSON.stringify(t.args as never, null, 2)}</pre>
+                                )}
+                                {t.error && <div className="text-red-500 mt-2">Error: {String(t.error)}</div>}
+                                {t.result != null && (
+                                    <pre className="whitespace-pre-wrap mt-2">{JSON.stringify(t.result as never, null, 2)}</pre>
+                                )}
                             </CardContent>
                         </Card>
                     ))}

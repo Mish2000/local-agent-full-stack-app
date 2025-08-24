@@ -5,7 +5,7 @@ import { useAuth } from "@/lib/useAuth";
 export function RequireAuth({ children }: { children: React.ReactNode }) {
     const { me, loading } = useAuth();
     if (loading) return <div className="container py-10 text-center">Loading…</div>;
-    if (!me) return <Navigate to="/login" replace />;
+    if (!me) return <Navigate to="/" replace />;
     return <>{children}</>;
 }
 

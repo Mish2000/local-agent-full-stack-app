@@ -2,7 +2,7 @@
 const API = "http://localhost:8000";
 
 export type ApiOptions<B = unknown> = {
-    method?: "GET" | "POST" | "PUT" | "DELETE";
+    method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
     body?: B;
     headers?: Record<string, string>;
 };
@@ -28,11 +28,12 @@ export async function api<T, B = unknown>(
             if (j?.detail) msg = j.detail;
             if (j?.error) msg = j.error;
             if (typeof j === "string") msg = j;
-        } catch { /* ignore */ }
+        } catch {
+            /* ignore */
+        }
         throw new Error(msg);
     }
 
     const text = await res.text();
     return (text ? JSON.parse(text) : null) as T;
 }
-

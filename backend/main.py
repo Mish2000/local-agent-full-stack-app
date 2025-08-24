@@ -4,7 +4,7 @@ import re
 import asyncio
 from typing import AsyncGenerator, List, Dict, Optional, Tuple
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -13,10 +13,13 @@ from tracing import Tracer
 from memory import memory
 from eval.ragas_eval import run_evaluation, get_last_summary
 
-from db import init_db, Base
-from auth import router as auth_router
+from db import init_db, Base, SessionLocal
+from auth import router as auth_router, _current_user, get_db
+from models import Chat, ChatMessage, User
+from sqlalchemy.orm import Session
 
 import httpx
+import datetime as dt
 
 # ---------------------- Minimal .env loader (no extra dependency) ----------------------
 def _load_env_file(path: str) -> None:
@@ -64,6 +67,9 @@ app.add_middleware(
 
 # --- Routers ---
 app.include_router(auth_router)
+
+from chats import router as chats_router
+app.include_router(chats_router)
 
 @app.on_event("startup")
 async def _on_startup():
@@ -139,6 +145,63 @@ def build_web_context(query: str, items: List[Dict]) -> Dict:
 
 def sse(event: str, data: str) -> bytes:
     return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+
+# <<< Helper to render DB messages into the same format as MemoryStore.render
+def render_history_from_rows(
+    rows: List[Dict[str, str]],
+    *,
+    lang: str,
+    max_chars: int = 40000
+) -> str:
+    if not rows:
+        return ""
+    label_user = "משתמש" if lang.lower().startswith("hebrew") else "User"
+    label_asst = "עוזר" if lang.lower().startswith("hebrew") else "Assistant"
+    lines: List[str] = []
+    for m in rows:
+        role = m["role"]
+        content = (m["content"] or "").strip()
+        label = label_user if role == "user" else label_asst
+        lines.append(f"{label}: {content}")
+    joined = "\n---\n".join(lines)
+    if len(joined) <= max_chars:
+        return joined
+    # Trim from end
+    acc: List[str] = []
+    total = 0
+    for line in reversed(lines):
+        piece = (line if not acc else f"---\n{line}")
+        if total + len(piece) > max_chars:
+            break
+        acc.append(line if not acc else f"---\n{line}")
+        total += len(piece)
+    return "".join(reversed(acc))
+
+# --- Helper: one-shot completion (no stream) ---
+async def ollama_generate(prompt: str, model: str = MODEL_NAME) -> str:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                # keep it tiny to avoid slowness for a title
+                "options": {"num_ctx": 512, "temperature": 0.2}
+            },
+        )
+        r.raise_for_status()
+        j = r.json()
+        # Ollama returns {"response": "...", ...}
+        return (j.get("response") or "").strip()
+
+def _title_prompt(first_user_text: str) -> str:
+    return (
+        "You are naming a chat based on the user's FIRST message below.\n"
+        "Rules: <= 6 words, Title Case, no quotes/emojis, specific but short.\n\n"
+        f"First message:\n{first_user_text}\n\n"
+        "Output ONLY the title."
+    )
 
 # ---------------------- Ollama stream ----------------------
 async def ensure_model_exists(client: httpx.AsyncClient, model: str) -> Optional[str]:
@@ -420,16 +483,14 @@ def _sanitize_web_query(text: str) -> str:
     return s[:200]
 
 # ---------------------- API ----------------------
-@app.post("/chat/clear")
-async def chat_clear(cid: str = Query(..., min_length=1, max_length=64, pattern=r"^[\w\-]+$")):
-    memory.clear(cid)
-    return JSONResponse({"ok": True, "cleared": cid})
-
 @app.get("/chat/stream")
 async def chat_stream(
     q: str = Query(..., description="User query"),
     mode: str = Query("auto", pattern="^(auto|none|dense|rerank|web)$"),
     cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
+    chat_id: Optional[int] = Query(None, ge=1),  # persisted chat id (authenticated)
+    scope: str = Query("user", pattern="^(user|chat)$"),  # retrieval namespace scope
+    request: Request = None,  # to identify current user
 ):
     """
     Modes:
@@ -438,11 +499,41 @@ async def chat_stream(
       - dense  : dense retrieval only (STRICT grounding)
       - rerank : dense + reranker (STRICT grounding)
       - web    : ALWAYS run web search (with up to 60s budget).
+
+    Namespacing:
+      - scope=user : retrieval filtered to the current user_id (if logged-in)
+      - scope=chat : retrieval filtered to this chat_id (must provide chat_id; falls back to user if missing)
     """
     async def gen() -> AsyncGenerator[bytes, None]:
         try:
             lang = "Hebrew" if is_hebrew(q) else "English"
             used_tool = False
+
+            # ---- Determine current user and (optional) DB chat + load history ----
+            db_user: Optional[User] = None
+            db_chat: Optional[Chat] = None
+            db_history_rows: List[Dict[str, str]] = []
+
+            async with SessionLocal() as db:
+                db_user = await _current_user(request, db)
+                if db_user and chat_id:
+                    # verify ownership
+                    db_chat = await db.get(Chat, chat_id)
+                    if db_chat and db_chat.user_id != db_user.id:
+                        db_chat = None
+                    if db_chat:
+                        # Load previous turns safely (Row -> mapping)
+                        res = await db.execute(
+                            ChatMessage.__table__
+                            .select()
+                            .where(ChatMessage.__table__.c.chat_id == chat_id)
+                            .order_by(ChatMessage.__table__.c.id.asc())
+                        )
+                        for row in res.mappings():
+                            db_history_rows.append({
+                                "role": row["role"],
+                                "content": row["content"],
+                            })
 
             # tracing
             trace_id = tracer.start_trace(q, mode)
@@ -452,11 +543,26 @@ async def chat_stream(
             prompt = ""
             resp_buf: List[str] = []
 
-            # history (before appending current user turn)
-            history_text = memory.render(cid, lang=lang, max_chars=HISTORY_CHAR_BUDGET)
-            memory.append(cid, "user", q)
+            # Build history text BEFORE appending this user turn
+            if db_user and db_chat:
+                history_text = render_history_from_rows(db_history_rows, lang=lang, max_chars=HISTORY_CHAR_BUDGET)
+            else:
+                history_text = memory.render(cid, lang=lang, max_chars=HISTORY_CHAR_BUDGET)
 
-            # Python sandbox path
+            # Persist/append the current user turn
+            if db_user and db_chat:
+                async with SessionLocal() as db:
+                    # attach new user message
+                    db.add(ChatMessage(chat_id=db_chat.id, role="user", content=q))
+                    # bump chat timestamp
+                    chat_obj = await db.get(Chat, db_chat.id)
+                    if chat_obj:
+                        chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
+                    await db.commit()
+            else:
+                memory.append(cid, "user", q)
+
+            # ------------------- Python sandbox path -------------------
             py_code = _extract_python_code(q)
             if py_code:
                 used_tool = True
@@ -490,32 +596,62 @@ async def chat_stream(
                     await asyncio.sleep(0)
 
                 assistant_text = "".join(resp_buf)
-                memory.append(cid, "assistant", assistant_text)
-                tracer.end_trace(trace_id, prompt, assistant_text, citations=[], ok=True)
 
+                if db_user and db_chat:
+                    async with SessionLocal() as db:
+                        db.add(ChatMessage(chat_id=db_chat.id, role="assistant", content=assistant_text))
+                        chat_obj = await db.get(Chat, db_chat.id)
+                        if chat_obj:
+                            chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
+                        await db.commit()
+                else:
+                    memory.append(cid, "assistant", assistant_text)
+
+                tracer.end_trace(trace_id, prompt, assistant_text, citations=[], ok=True)
                 yield sse("sources", "[]")
                 yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
                 return
 
-            # Regular modes
+            # ------------------- RAG where-filter (namespacing) --------------------
+            rag_where: Optional[Dict[str, str]] = None
+            if db_user:
+                if scope == "chat" and chat_id:
+                    rag_where = {"chat_id": str(chat_id)}
+                else:
+                    rag_where = {"user_id": str(db_user.id)}
+
+            # ------------------- Regular modes ------------------------------------
             if mode == "none":
-                prompt = build_prompt_single(q, "", lang=lang, strict=False, mode="general", history_text=history_text)
+                prompt = build_prompt_single(
+                    q, "", lang=lang, strict=False, mode="general", history_text=history_text
+                )
 
             elif mode in ("dense", "rerank"):
-                retriever = Retriever(k_initial=12, k_final=RAG_TOP_K, use_reranker=(mode == "rerank"))
-                docs = retriever.retrieve(q)
+                retriever = Retriever(
+                    k_initial=12,
+                    k_final=int(os.getenv("RAG_TOP_K", "5")),
+                    use_reranker=(mode == "rerank"),
+                )
+                docs = retriever.retrieve(q, where=rag_where)
                 ctx_rag = build_context(q, docs)
-                prompt = build_prompt_single(q, ctx_rag["context_text"], lang=lang, strict=True, mode=mode, history_text=history_text)
+                prompt = build_prompt_single(
+                    q, ctx_rag["context_text"], lang=lang, strict=True, mode=mode, history_text=history_text
+                )
                 citations_combined = ctx_rag["citations"]
                 used_tool = True
 
                 ev = {
                     "name": "retrieve_knowledge",
-                    "args": {"query": q, "mode": mode},
+                    "args": {"query": q, "mode": mode, "where": rag_where},
                     "result": ctx_rag["citations"],
                 }
                 yield sse("tool", json.dumps(ev, ensure_ascii=False))
-                tracer.log_tool(trace_id, "retrieve_knowledge", {"query": q, "mode": mode}, ctx_rag["citations"])
+                tracer.log_tool(
+                    trace_id,
+                    "retrieve_knowledge",
+                    {"query": q, "mode": mode, "where": rag_where},
+                    ctx_rag["citations"],
+                )
 
             elif mode == "web":
                 ws = WebSearcher()
@@ -524,41 +660,60 @@ async def chat_stream(
                 provider = "none"
                 debug: List[str] = []
                 timed_out_note = None
+                timed_out = False
 
                 if sanitized:
-                    items, provider, debug, timed_out = await ws.search(sanitized, max_results=5, timeout=15.0, time_budget_sec=60.0)
+                    items, provider, debug, timed_out = await ws.search(
+                        sanitized, max_results=5, timeout=15.0, time_budget_sec=60.0
+                    )
                     if timed_out:
-                        timed_out_note = "No web results were found within a 60-second search budget. Inform the user and suggest refining the query."
+                        timed_out_note = (
+                            "No web results were found within a 60-second search budget. "
+                            "Inform the user and suggest refining the query."
+                        )
                 ev = {
                     "name": "web_search",
                     "args": {"query": sanitized or "(skipped due to code-like text)"},
                     "result": {"provider": provider, "count": len(items), "debug": debug, "items": items},
                 }
                 yield sse("tool", json.dumps(ev, ensure_ascii=False))
-                tracer.log_tool(trace_id, "web_search", {"query": sanitized or "(skipped)"}, {
-                    "provider": provider, "count": len(items), "debug": debug, "items": items
-                })
+                tracer.log_tool(
+                    trace_id,
+                    "web_search",
+                    {"query": sanitized or "(skipped)"},
+                    {"provider": provider, "count": len(items), "debug": debug, "items": items},
+                )
                 used_tool = True
 
                 ctx_web = build_web_context(q, items)
                 citations_combined = ctx_web["citations"]
                 if items:
-                    prompt = build_prompt_single(q, ctx_web["context_text"], lang=lang, strict=False, mode="web", history_text=history_text)
+                    prompt = build_prompt_single(
+                        q, ctx_web["context_text"], lang=lang, strict=False, mode="web", history_text=history_text
+                    )
                 else:
-                    prompt = build_prompt_single(q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note, history_text=history_text)
+                    prompt = build_prompt_single(
+                        q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note, history_text=history_text
+                    )
 
             else:  # auto
-                retriever = Retriever(k_initial=12, k_final=RAG_TOP_K, use_reranker=True)
-                rag_docs = retriever.retrieve(q)
+                retriever = Retriever(
+                    k_initial=12,
+                    k_final=int(os.getenv("RAG_TOP_K", "5")),
+                    use_reranker=True,
+                )
+                rag_docs = retriever.retrieve(q, where=rag_where)
                 ctx_rag = build_context(q, rag_docs)
 
                 ev_probe = {
                     "name": "retrieve_knowledge_probe",
-                    "args": {"query": q},
+                    "args": {"query": q, "where": rag_where},
                     "result": ctx_rag["citations"],
                 }
                 yield sse("tool", json.dumps(ev_probe, ensure_ascii=False))
-                tracer.log_tool(trace_id, "retrieve_knowledge_probe", {"query": q}, ctx_rag["citations"])
+                tracer.log_tool(
+                    trace_id, "retrieve_knowledge_probe", {"query": q, "where": rag_where}, ctx_rag["citations"]
+                )
 
                 rag_used = len(rag_docs) > 0
 
@@ -568,7 +723,11 @@ async def chat_stream(
                 if rag_keywords and rag_docs:
                     text0 = (rag_docs[0].get("text") or "").lower()
                     rag_overlap = sum(1 for k in rag_keywords if k in text0)
-                rag_strong = (rag_overlap >= 1) or (rag_docs and isinstance(rag_docs[0].get("distance", 1.0), (int, float)) and float(rag_docs[0]["distance"]) < 0.55)
+                rag_strong = (rag_overlap >= 1) or (
+                    rag_docs
+                    and isinstance(rag_docs[0].get("distance", 1.0), (int, float))
+                    and float(rag_docs[0]["distance"]) < 0.55
+                )
 
                 ctx_web = {"context_text": "", "citations": []}
                 if run_web or not rag_strong:
@@ -579,19 +738,31 @@ async def chat_stream(
                     debug: List[str] = []
                     timed_out = False
                     if sanitized:
-                        items, provider, debug, timed_out = await ws.search(sanitized, max_results=5, timeout=15.0, time_budget_sec=20.0)
+                        items, provider, debug, timed_out = await ws.search(
+                            sanitized, max_results=5, timeout=15.0, time_budget_sec=20.0
+                        )
                     ev_web = {
                         "name": "web_search",
                         "args": {"query": sanitized or "(skipped due to code-like text)"},
-                        "result": {"provider": provider, "count": len(items), "debug": debug + [f"timed_out={1 if timed_out else 0}"], "items": items},
+                        "result": {
+                            "provider": provider,
+                            "count": len(items),
+                            "debug": debug + [f"timed_out={1 if timed_out else 0}"],
+                            "items": items,
+                        },
                     }
                     yield sse("tool", json.dumps(ev_web, ensure_ascii=False))
-                    tracer.log_tool(trace_id, "web_search", {"query": sanitized or "(skipped)"}, {
-                        "provider": provider, "count": len(items), "debug": debug + [f"timed_out={1 if timed_out else 0}"], "items": items
-                    })
+                    tracer.log_tool(
+                        trace_id,
+                        "web_search",
+                        {"query": sanitized or "(skipped)"},
+                        {"provider": provider, "count": len(items), "debug": debug + [f"timed_out={1 if timed_out else 0}"], "items": items},
+                    )
                     ctx_web = build_web_context(q, items)
 
-                prompt = build_prompt_mixed(q, ctx_rag["context_text"], ctx_web["context_text"], lang=lang, history_text=history_text)
+                prompt = build_prompt_mixed(
+                    q, ctx_rag["context_text"], ctx_web["context_text"], lang=lang, history_text=history_text
+                )
                 citations_combined = ctx_rag["citations"] + ctx_web["citations"]
                 used_tool = rag_used or (len(ctx_web["citations"]) > 0)
 
@@ -605,9 +776,18 @@ async def chat_stream(
             yield sse("sources", json.dumps(citations_combined, ensure_ascii=False))
 
             assistant_text = "".join(resp_buf)
-            memory.append(cid, "assistant", assistant_text)
-            tracer.end_trace(trace_id, prompt, assistant_text, citations_combined, ok=True)
 
+            if db_user and db_chat:
+                async with SessionLocal() as db:
+                    db.add(ChatMessage(chat_id=db_chat.id, role="assistant", content=assistant_text))
+                    chat_obj = await db.get(Chat, db_chat.id)
+                    if chat_obj:
+                        chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
+                    await db.commit()
+            else:
+                memory.append(cid, "assistant", assistant_text)
+
+            tracer.end_trace(trace_id, prompt, assistant_text, citations_combined, ok=True)
             yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
         except Exception as e:
             yield sse("token", f"ERROR: backend exception: {e}")
@@ -625,3 +805,55 @@ async def chat_stream(
         "X-Accel-Buffering": "no",
     }
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+@app.post("/chats/{chat_id}/auto-title")
+async def auto_title(chat_id: int, request: Request, db=Depends(get_db)):
+    """
+    Generates a concise title for the given chat based on its FIRST user message,
+    saves it to the DB, and returns { id, title }.
+    Auth: current session cookie (same as other endpoints).
+    """
+    # Deps/typing (keep local to avoid file-wide import churn)
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy import select
+
+    assert isinstance(db, AsyncSession)
+
+    # Identify current user (same helper used elsewhere in main.py)
+    user = await _current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Load chat and validate ownership
+    chat = await db.get(Chat, chat_id)
+    if not chat or chat.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # First user message (oldest) for this chat
+    q = (
+        ChatMessage.__table__
+        .select()
+        .where(
+            ChatMessage.__table__.c.chat_id == chat_id,
+            ChatMessage.__table__.c.role == "user",
+        )
+        .order_by(ChatMessage.__table__.c.created_at.asc())
+        .limit(1)
+    )
+    res = await db.execute(q)
+    first_row = res.mappings().first()
+    if not first_row:
+        raise HTTPException(status_code=400, detail="No user message found for this chat")
+
+    first_user_text = (first_row.get("content") or "").strip()
+    raw = await ollama_generate(_title_prompt(first_user_text))
+    title = (raw or "").strip().strip('"').strip()
+    if not title:
+        title = "Chat"
+    title = title[:80]  # conservative cap
+
+    chat.title = title
+    await db.commit()
+
+    return {"id": chat.id, "title": chat.title}
+

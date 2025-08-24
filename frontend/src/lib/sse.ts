@@ -11,8 +11,8 @@ export type Source = {
 
 export type ToolEvent = {
     name: string;
-    args?: Record<string, never>;
-    result?: never;
+    args?: Record<string, unknown>;
+    result?: unknown;
     error?: string;
 };
 
@@ -27,29 +27,46 @@ export type SSEHandlers = {
 
 export type RagMode = "auto" | "none" | "dense" | "rerank" | "web";
 
+type OpenOpts = {
+    mode?: RagMode;
+    cid?: string;                // guest/ephemeral id
+    chatId?: number;             // persisted chat id
+    scope?: "user" | "chat";     // retrieval namespacing (defaults in backend: user)
+};
+
 export function openChatSSE(
     prompt: string,
     handlers: SSEHandlers,
-    opts?: { mode?: RagMode; cid?: string } // <<< NEW
+    opts: OpenOpts = {}
 ): EventSource {
     const base = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
-    const mode: RagMode = opts?.mode ?? "auto";
-    const cid = opts?.cid ?? "default"; // <<< NEW
-    const url = `${base}/chat/stream?q=${encodeURIComponent(prompt)}&mode=${mode}&cid=${encodeURIComponent(cid)}`;
-    const es = new EventSource(url);
+    const mode: RagMode = opts.mode ?? "auto";
+    const params = new URLSearchParams({
+        q: prompt,
+        mode,
+    });
+
+    if (opts.cid) params.set("cid", opts.cid);
+    if (typeof opts.chatId === "number") params.set("chat_id", String(opts.chatId));
+    if (opts.scope) params.set("scope", opts.scope);
+
+    const url = `${base}/chat/stream?${params.toString()}`;
+
+    // IMPORTANT: include cookies with SSE across origins
+    const es = new EventSource(url, { withCredentials: true });
 
     es.addEventListener("token", (e: MessageEvent) => handlers.onToken(e.data));
     es.addEventListener("trace", (e: MessageEvent) => {
         try {
             const obj = JSON.parse(e.data);
             if (obj?.id) handlers.onTrace?.(obj.id);
-        } catch { /* empty */ }
+        } catch { /* ignore */ }
     });
     es.addEventListener("sources", (e: MessageEvent) => {
-        try { handlers.onSources?.(JSON.parse(e.data)); } catch { /* empty */ }
+        try { handlers.onSources?.(JSON.parse(e.data)); } catch { /* ignore */ }
     });
     es.addEventListener("tool", (e: MessageEvent) => {
-        try { handlers.onTool?.(JSON.parse(e.data)); } catch { /* empty */ }
+        try { handlers.onTool?.(JSON.parse(e.data)); } catch { /* ignore */ }
     });
     es.addEventListener("done", () => {
         handlers.onDone();
