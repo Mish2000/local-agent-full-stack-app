@@ -2,6 +2,12 @@ import os
 import json
 import re
 import asyncio
+import sys
+import time
+import shutil
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import AsyncGenerator, List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, Query, Depends, Request, HTTPException
@@ -44,10 +50,82 @@ _load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
 # --------- Settings (env-driven) ---------
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
 MODEL_NAME = os.getenv("MODEL_NAME", "aya-expanse:8b")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 HISTORY_CHAR_BUDGET = int(os.getenv("HISTORY_CHAR_BUDGET", "3500"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "0"))
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+def _is_local_ollama(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1"}
+    except Exception:
+        return False
+
+def _resolve_ollama_bin() -> str | None:
+    # Respect explicit path; otherwise try PATH; otherwise common Windows install path
+    candidates = [
+        os.getenv("OLLAMA_BIN"),
+        shutil.which("ollama"),
+        r"C:\Program Files\Ollama\ollama.exe" if os.name == "nt" else None,
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return None
+
+def _spawn_ollama_detached(bin_path: str) -> None:
+    # Start "ollama serve" fully detached so the API keeps running if uvicorn reloads
+    cmd = [bin_path, "serve"]
+    kwargs: dict = dict(
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        cwd=str(Path.home()),
+    )
+    if sys.platform.startswith("win"):
+        # CREATE_NEW_PROCESS_GROUP (0x00000200) | DETACHED_PROCESS (0x00000008)
+        kwargs["creationflags"] = 0x00000200 | 0x00000008  # type: ignore[attr-defined]
+    else:
+        # Start in its own session
+        kwargs["preexec_fn"] = os.setsid  # type: ignore[attr-defined]
+    subprocess.Popen(cmd, **kwargs)
+
+async def _ollama_ready(client: httpx.AsyncClient) -> bool:
+    try:
+        r = await client.get(f"{OLLAMA_HOST}/api/version", timeout=1.5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+async def ensure_ollama_running() -> None:
+    # If host is remote, do not attempt to spawn locally
+    async with httpx.AsyncClient() as client:
+        if await _ollama_ready(client):
+            return
+
+        if not _is_local_ollama(OLLAMA_HOST):
+            # Remote or non-local host: just proceed without autostart
+            return
+
+        bin_path = _resolve_ollama_bin()
+        if not bin_path:
+            print("[startup] OLLAMA not reachable and 'ollama' binary not found; skipping autostart")
+            return
+
+        print("[startup] OLLAMA not reachable; starting 'ollama serve'…")
+        _spawn_ollama_detached(bin_path)
+
+        # Poll for readiness (max ~30s)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if await _ollama_ready(client):
+                print("[startup] OLLAMA is ready")
+                return
+            await asyncio.sleep(0.8)
+
+        print("[startup] Warning: OLLAMA did not become ready within 30s")
 
 # Tools
 from tools.web_search import WebSearcher
@@ -73,6 +151,7 @@ app.include_router(chats_router)
 
 @app.on_event("startup")
 async def _on_startup():
+    await ensure_ollama_running()
     await init_db(Base)
 
 tracer = Tracer()

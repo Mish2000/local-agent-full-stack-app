@@ -347,6 +347,19 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         setLastTraceId(null);
     };
 
+    // Global Cmd/Ctrl+K => new blank chat (does NOT create a DB row yet)
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+                e.preventDefault();
+                doNewChat();
+            }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, [doNewChat]);
+
+
     const doRenameChat = async (id: number) => {
         const current = chats.find((c) => c.id === id);
         const title = prompt("שם חדש לשיחה:", current?.title || "");
