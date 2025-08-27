@@ -10,6 +10,7 @@ export type Source = {
 };
 
 export type ToolEvent = {
+    tool: string;
     name: string;
     args?: Record<string, unknown>;
     result?: unknown;

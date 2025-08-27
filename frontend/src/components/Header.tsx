@@ -5,9 +5,9 @@ import { Button } from "@/components/ui/button";
 import { NavLink, useNavigate } from "react-router-dom";
 import { type RagMode } from "@/lib/sse";
 import { LogOut, LogIn, UserPlus, Sparkles } from "lucide-react";
+import StepsToggle from "@/components/StepsToggle";
 
 type Props = {
-    backendStatus: string;
     ragMode: RagMode;
     onChangeMode: (m: RagMode) => void;
     onNewChat: () => void;
@@ -24,7 +24,7 @@ const MODE_DESCRIPTIONS: Record<RagMode, string> = {
 };
 
 const Header = forwardRef<HTMLElement, Props>(function Header(
-    { backendStatus, ragMode, onChangeMode, onNewChat, showModePicker = true, onAuthNav },
+    { ragMode, onChangeMode, onNewChat, showModePicker = true, onAuthNav },
     ref
 ) {
     const { me, logout } = useAuth();
@@ -74,12 +74,8 @@ const Header = forwardRef<HTMLElement, Props>(function Header(
                         )}
                     </div>
 
-                    {/* Right: Status + Auth */}
-                    <div className="header-right flex items-center gap-3">
-            <span className="text-[12px] px-2 py-1 rounded-full border border-[var(--border)] bg-[var(--bg)]">
-              {backendStatus === "ok" ? "Backend: OK" : `Backend: ${backendStatus}`}
-            </span>
-
+                    {/* Right: Auth + steps toggle (same heights for symmetry) */}
+                    <div className="header-right flex items-center gap-2">
                         {me ? (
                             <Button
                                 variant="outline"
@@ -105,6 +101,7 @@ const Header = forwardRef<HTMLElement, Props>(function Header(
                                 </Button>
                             </div>
                         )}
+                        <StepsToggle />
                     </div>
                 </div>
             </div>

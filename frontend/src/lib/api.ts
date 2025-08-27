@@ -37,3 +37,34 @@ export async function api<T, B = unknown>(
     const text = await res.text();
     return (text ? JSON.parse(text) : null) as T;
 }
+
+// Upload docs for RAG: accepts multiple files; scope can be "user" or "chat"
+export async function uploadDocs(
+    files: File[],
+    scope: "user" | "chat" = "user",
+    chatId?: string | number
+): Promise<{ ok: boolean; chunks: number; files_indexed: number; files_skipped: string[] }> {
+    const fd = new FormData();
+    for (const f of files) fd.append("files", f);
+    // send scope/chat_id in the body so Postman & browsers are equally happy
+    fd.append("scope", scope);
+    if (scope === "chat" && chatId != null) fd.append("chat_id", String(chatId));
+
+    const res = await fetch(`${API}/rag/upload`, {
+        method: "POST",
+        credentials: "include",
+        body: fd,
+    });
+    if (!res.ok) {
+        let msg = `Upload failed (${res.status})`;
+        try {
+            const j = await res.json();
+            if (j?.detail) msg = j.detail;
+        } catch { /* ignore */ }
+        throw new Error(msg);
+    }
+    return res.json();
+}
+
+
+

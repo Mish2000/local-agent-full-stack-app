@@ -74,7 +74,7 @@ html, body, #root {
     overflow-x: hidden;
     height: 100%;
     direction: ltr;          /* keep scrollbar on the RIGHT in RTL locales */
-    scroll-snap-type: y mandatory;
+    scroll-snap-type: y proximity;
     scrollbar-gutter: stable;
 }
 
@@ -183,7 +183,8 @@ pre { padding: 10px 12px; border-radius: 10px; overflow-x: auto; border: 1px sol
 /* Floating “jump to latest” */
 .jump-down {
     position: fixed;
-    right: 24px;
+    left: 24px;
+    right: auto;
     /* bottom set inline by Chat.tsx so it sits above composer */
     width: 44px;
     height: 44px;
@@ -259,3 +260,61 @@ pre { padding: 10px 12px; border-radius: 10px; overflow-x: auto; border: 1px sol
 
 /* Make sure the fixed viewport spans full width and never introduces horizontal scrollbars */
 .chat-viewport { left: 0; right: 0; overflow: hidden; }
+
+/* --- Assistant message code-block layout (global, robust) --- */
+.msg.assistant :not(pre) > code {
+    /* Inline code spans: keep on one line */
+    white-space: nowrap;
+}
+
+/* Fenced code blocks: preserve newlines, expand vertically as content streams */
+.msg.assistant pre {
+    white-space: pre;      /* preserve \n exactly like editors */
+    overflow-x: auto; /* keep long single lines scrollable horizontally */
+    margin: 0.25rem 0; /* small breathing room */
+}
+
+/* Code element inside the pre gains the same white-space and fills the block */
+.msg.assistant pre code {
+    display: block;
+    white-space: inherit;
+}
+
+/* --- Assistant message toolbar (no overlap with content) --- */
+.msg.assistant { position: relative; }
+.msg-toolbar {
+    position: absolute;
+    top: 4px;               /* inside the bubble */
+    right: 6px;
+    display: flex;
+    gap: 6px;
+    background: var(--panel);
+    color: var(--text-strong);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px 8px;
+    box-shadow: var(--shadow);
+    z-index: 2;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .15s ease;
+}
+
+/* Reveal on hover/focus for clean look */
+.msg.assistant:hover .msg-toolbar,
+.msg.assistant:focus-within .msg-toolbar {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.msg-toolbar-btn {
+    height: 28px;
+    line-height: 26px;
+    font-size: 12px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    cursor: pointer;
+}
+.msg-toolbar-btn:hover { filter: brightness(0.98); }

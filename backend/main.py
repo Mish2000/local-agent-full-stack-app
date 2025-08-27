@@ -1,31 +1,39 @@
-import os
-import json
-import re
 import asyncio
-import sys
-import time
+import datetime as dt
+import json
+import os
+import re
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import AsyncGenerator, List, Dict, Tuple
+from typing import Optional
 from urllib.parse import urlparse
-from typing import AsyncGenerator, List, Dict, Optional, Tuple
-
-from fastapi import FastAPI, Query, Depends, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-
-from rag.retriever import Retriever
-from tracing import Tracer
-from memory import memory
-from eval.ragas_eval import run_evaluation, get_last_summary
-
-from db import init_db, Base, SessionLocal
-from auth import router as auth_router, _current_user, get_db
-from models import Chat, ChatMessage, User
-from sqlalchemy.orm import Session
 
 import httpx
-import datetime as dt
+from fastapi import Depends, Request
+from fastapi import FastAPI, HTTPException
+from fastapi import UploadFile, File, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import UploadFile, File, Form, Query
+from auth import get_db, _current_user
+from auth import router as auth_router
+from db import init_db, Base, SessionLocal
+from eval.ragas_eval import run_evaluation, get_last_summary
+from memory import memory
+from models import Chat, ChatMessage
+from models import User
+from rag.ingest import ingest_bytes
+from rag.retriever import Retriever
+from tracing import Tracer
+from typing import Optional, List
+from fastapi import HTTPException, Depends, Request
+from rag.ingest import ingest_bytes
+from models import User
+
 
 # ---------------------- Minimal .env loader (no extra dependency) ----------------------
 def _load_env_file(path: str) -> None:
@@ -44,6 +52,7 @@ def _load_env_file(path: str) -> None:
     except FileNotFoundError:
         pass
 
+
 # Load backend/.env if present
 _load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -55,6 +64,8 @@ HISTORY_CHAR_BUDGET = int(os.getenv("HISTORY_CHAR_BUDGET", "3500"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "0"))
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+
+
 def _is_local_ollama(url: str) -> bool:
     try:
         u = urlparse(url)
@@ -62,6 +73,7 @@ def _is_local_ollama(url: str) -> bool:
         return host in {"127.0.0.1", "localhost", "::1"}
     except Exception:
         return False
+
 
 def _resolve_ollama_bin() -> str | None:
     # Respect explicit path; otherwise try PATH; otherwise common Windows install path
@@ -74,6 +86,7 @@ def _resolve_ollama_bin() -> str | None:
         if c and Path(c).exists():
             return c
     return None
+
 
 def _spawn_ollama_detached(bin_path: str) -> None:
     # Start "ollama serve" fully detached so the API keeps running if uvicorn reloads
@@ -92,12 +105,14 @@ def _spawn_ollama_detached(bin_path: str) -> None:
         kwargs["preexec_fn"] = os.setsid  # type: ignore[attr-defined]
     subprocess.Popen(cmd, **kwargs)
 
+
 async def _ollama_ready(client: httpx.AsyncClient) -> bool:
     try:
         r = await client.get(f"{OLLAMA_HOST}/api/version", timeout=1.5)
         return r.status_code == 200
     except Exception:
         return False
+
 
 async def ensure_ollama_running() -> None:
     # If host is remote, do not attempt to spawn locally
@@ -127,6 +142,12 @@ async def ensure_ollama_running() -> None:
 
         print("[startup] Warning: OLLAMA did not become ready within 30s")
 
+
+async def current_user_dep(request: Request, db=Depends(get_db)) -> Optional[User]:
+    # Delegate to your real helper
+    return await _current_user(request, db)
+
+
 # Tools
 from tools.web_search import WebSearcher
 from tools.py_eval import run_python
@@ -147,12 +168,15 @@ app.add_middleware(
 app.include_router(auth_router)
 
 from chats import router as chats_router
+
 app.include_router(chats_router)
+
 
 @app.on_event("startup")
 async def _on_startup():
     await ensure_ollama_running()
     await init_db(Base)
+
 
 tracer = Tracer()
 
@@ -165,17 +189,21 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
 
 # ---------------------- Helpers ----------------------
 def is_hebrew(s: str) -> bool:
     return any("\u0590" <= ch <= "\u05FF" for ch in s or "")
 
+
 def truncate(txt: str, n: int = 700) -> str:
     txt = (txt or "").replace("\n", " ").strip()
     return txt if len(txt) <= n else txt[: n - 1] + "…"
+
 
 def _host_from_url(u: str) -> str:
     try:
@@ -183,6 +211,7 @@ def _host_from_url(u: str) -> str:
         return urlparse(u).netloc or u
     except Exception:
         return u
+
 
 def build_context(query: str, docs: List[Dict]) -> Dict:
     cites = []
@@ -204,6 +233,7 @@ def build_context(query: str, docs: List[Dict]) -> Dict:
         ctx_lines.append(f"[{i}] {src}{range_txt}\n{preview}\n")
     return {"context_text": "\n".join(ctx_lines), "citations": cites}
 
+
 def build_web_context(query: str, items: List[Dict]) -> Dict:
     cites = []
     ctx_lines = []
@@ -222,15 +252,26 @@ def build_web_context(query: str, items: List[Dict]) -> Dict:
         ctx_lines.append(f"[{i}] {title or host} — {host}\n{snippet}\n")
     return {"context_text": "\n".join(ctx_lines), "citations": cites}
 
+
 def sse(event: str, data: str) -> bytes:
-    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+    """
+    Build a compliant SSE event. If `data` contains newlines, emit one `data:` line per
+    payload line, so the browser reconstructs the exact text with newlines preserved.
+    """
+    if data is None:
+        data = ""
+    # Normalize newlines and split into lines
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
+    payload = "\n".join(f"data: {line}" for line in data.split("\n"))
+    return f"event: {event}\n{payload}\n\n".encode("utf-8")
+
 
 # <<< Helper to render DB messages into the same format as MemoryStore.render
 def render_history_from_rows(
-    rows: List[Dict[str, str]],
-    *,
-    lang: str,
-    max_chars: int = 40000
+        rows: List[Dict[str, str]],
+        *,
+        lang: str,
+        max_chars: int = 40000
 ) -> str:
     if not rows:
         return ""
@@ -256,6 +297,7 @@ def render_history_from_rows(
         total += len(piece)
     return "".join(reversed(acc))
 
+
 # --- Helper: one-shot completion (no stream) ---
 async def ollama_generate(prompt: str, model: str = MODEL_NAME) -> str:
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -274,6 +316,7 @@ async def ollama_generate(prompt: str, model: str = MODEL_NAME) -> str:
         # Ollama returns {"response": "...", ...}
         return (j.get("response") or "").strip()
 
+
 def _title_prompt(first_user_text: str) -> str:
     return (
         "You are naming a chat based on the user's FIRST message below.\n"
@@ -281,6 +324,7 @@ def _title_prompt(first_user_text: str) -> str:
         f"First message:\n{first_user_text}\n\n"
         "Output ONLY the title."
     )
+
 
 # ---------------------- Ollama stream ----------------------
 async def ensure_model_exists(client: httpx.AsyncClient, model: str) -> Optional[str]:
@@ -297,6 +341,7 @@ async def ensure_model_exists(client: httpx.AsyncClient, model: str) -> Optional
     if "error" in obj:
         return f"Ollama error: {obj.get('error')}"
     return None
+
 
 async def ollama_stream(prompt: str) -> AsyncGenerator[str, None]:
     async with httpx.AsyncClient(timeout=None) as client:
@@ -333,6 +378,7 @@ async def ollama_stream(prompt: str) -> AsyncGenerator[str, None]:
         except Exception as e:
             yield f"ERROR: Ollama stream exception: {e}"
 
+
 # ---------------------- Auto tools: heuristics & probe ----------------------
 def _have_langchain() -> Tuple[bool, Optional[str]]:
     try:
@@ -341,6 +387,7 @@ def _have_langchain() -> Tuple[bool, Optional[str]]:
         return True, None
     except Exception as e:
         return False, str(e)
+
 
 _HEBREW_DOC_HINTS = [
     r"\bמסמך\b", r"\bמסמכים\b", r"\bקובץ\b", r"\bקבצים\b", r"\bדוגמה\b",
@@ -363,15 +410,23 @@ _EN_WEB_HINTS = [
 _doc_hint_patterns = [re.compile(p, re.IGNORECASE) for p in (_HEBREW_DOC_HINTS + _EN_DOC_HINTS)]
 _web_hint_patterns = [re.compile(p, re.IGNORECASE) for p in (_HEBREW_WEB_HINTS + _EN_WEB_HINTS)]
 
+
 def _heuristic_wants_rag(q: str) -> bool:
     return any(pat.search(q or "") for pat in _doc_hint_patterns)
+
 
 def _heuristic_wants_web(q: str) -> bool:
     return any(pat.search(q or "") for pat in _web_hint_patterns)
 
-_HE_STOP = {"של","עם","על","לא","כן","אם","או","זה","זו","אלה","הוא","היא","הם","הן","אני","אתה","את","אתם","אתן","אנחנו","כל","גם","אך","אבל","כדי","כי","כמו","אלא","שרק","רק","עוד","כבר","שהוא","שהיא","שזה","שזו","שאין","מאוד","בה","בו","בהם","בהן","לפי","מתוך"}
-_EN_STOP = {"the","a","an","and","or","but","if","so","to","of","in","on","for","by","with","as","at","is","are","was","were","be","been","being","it","this","that","these","those","from","i","you","he","she","we","they","them","his","her","their","our","your","my","me"}
+
+_HE_STOP = {"של", "עם", "על", "לא", "כן", "אם", "או", "זה", "זו", "אלה", "הוא", "היא", "הם", "הן", "אני", "אתה", "את",
+            "אתם", "אתן", "אנחנו", "כל", "גם", "אך", "אבל", "כדי", "כי", "כמו", "אלא", "שרק", "רק", "עוד", "כבר",
+            "שהוא", "שהיא", "שזה", "שזו", "שאין", "מאוד", "בה", "בו", "בהם", "בהן", "לפי", "מתוך"}
+_EN_STOP = {"the", "a", "an", "and", "or", "but", "if", "so", "to", "of", "in", "on", "for", "by", "with", "as", "at",
+            "is", "are", "was", "were", "be", "been", "being", "it", "this", "that", "these", "those", "from", "i",
+            "you", "he", "she", "we", "they", "them", "his", "her", "their", "our", "your", "my", "me"}
 _tok_pat = re.compile(r"[\w\u0590-\u05FF]+")
+
 
 def _extract_keywords(s: str, min_len: int = 4) -> List[str]:
     toks = [t.lower() for t in _tok_pat.findall(s or "")]
@@ -382,6 +437,7 @@ def _extract_keywords(s: str, min_len: int = 4) -> List[str]:
         out.append(t)
     return out
 
+
 def _auto_decision_prompt() -> str:
     return (
         "Decide whether the user's question likely requires retrieving from the user's LOCAL documents (RAG). "
@@ -389,13 +445,16 @@ def _auto_decision_prompt() -> str:
         "If the user asks about a specific document, example, file, sources, lines, or uploaded content, choose true."
     )
 
+
 def _extract_json(text: str) -> Optional[dict]:
-    start = text.find("{"); end = text.rfind("}")
+    start = text.find("{");
+    end = text.rfind("}")
     if start == -1 or end == -1 or end <= start: return None
     try:
-        return json.loads(text[start:end+1])
+        return json.loads(text[start:end + 1])
     except Exception:
         return None
+
 
 async def _classify_with_llm(user_query: str) -> Optional[Dict]:
     ok, err = _have_langchain()
@@ -411,6 +470,7 @@ async def _classify_with_llm(user_query: str) -> Optional[Dict]:
     if not obj:
         return {"error": "Classifier JSON parse failed", "raw": raw}
     return obj
+
 
 async def _probe_retrieval(user_query: str) -> Tuple[bool, List[Dict], str]:
     retriever = Retriever(k_initial=12, k_final=5, use_reranker=True)
@@ -429,6 +489,7 @@ async def _probe_retrieval(user_query: str) -> Tuple[bool, List[Dict], str]:
         return True, docs, f"Probe: vector match (distance={d0:.3f})."
     return False, docs, "Probe: weak lexical/vector signals."
 
+
 # ---------------------- Diagnostics ----------------------
 @app.get("/tools/web/test")
 async def web_test(q: str = Query(..., description="Query")):
@@ -441,10 +502,12 @@ async def web_test(q: str = Query(..., description="Query")):
         "items": items,
     }
 
+
 @app.get("/tools/py/test")
 async def py_test():
     res = await run_python("print(sum(i*i for i in range(1, 11)))")
     return res
+
 
 # ---------------------- RAG Evaluation ----------------------
 @app.get("/eval/ragas/run")
@@ -460,6 +523,7 @@ async def eval_ragas_run(limit: int = Query(25, ge=1, le=200)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 @app.get("/eval/ragas/last")
 def eval_ragas_last():
     """
@@ -470,8 +534,10 @@ def eval_ragas_last():
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 # ---------------------- Guardrails & Prompt builders (history-aware) ----------------------
-def _base_system_prompt(lang: str, strict: bool = False, mode: str = "general", timed_out_note: Optional[str] = None) -> str:
+def _base_system_prompt(lang: str, strict: bool = False, mode: str = "general",
+                        timed_out_note: Optional[str] = None) -> str:
     if strict:
         policy = (
             "Use ONLY the provided context. If it is insufficient or not relevant, say so briefly and do not invent content."
@@ -492,28 +558,30 @@ def _base_system_prompt(lang: str, strict: bool = False, mode: str = "general", 
     timeout_note = f" Note: {timed_out_note}" if timed_out_note else ""
     return f"You are a helpful assistant. Always answer in {lang}. {policy}{web_note}{tools_rules}{timeout_note}"
 
+
 def build_prompt_single(
-    user_query: str,
-    context_text: str,
-    *,
-    lang: str,
-    strict: bool,
-    mode: str,
-    timed_out_note: Optional[str] = None,
-    history_text: str = "",
+        user_query: str,
+        context_text: str,
+        *,
+        lang: str,
+        strict: bool,
+        mode: str,
+        timed_out_note: Optional[str] = None,
+        history_text: str = "",
 ) -> str:
     sys = _base_system_prompt(lang, strict=strict, mode=mode, timed_out_note=timed_out_note)
     convo = f"\n# Conversation so far:\n{history_text}\n" if history_text else ""
     ctx = f"\n# Context:\n{context_text}\n" if context_text else "\n# Context:\n(none)\n"
     return f"{sys}{convo}{ctx}\n# Question:\n{user_query}\n\n# Answer:"
 
+
 def build_prompt_mixed(
-    user_query: str,
-    ctx_rag: str,
-    ctx_web: str,
-    *,
-    lang: str,
-    history_text: str = "",
+        user_query: str,
+        ctx_rag: str,
+        ctx_web: str,
+        *,
+        lang: str,
+        history_text: str = "",
 ) -> str:
     sys = (
         f"You are a helpful assistant. Always answer in {lang}. "
@@ -528,6 +596,7 @@ def build_prompt_mixed(
         f"# Question:\n{user_query}\n\n# Answer:"
     )
 
+
 # ---------------------- Code detection & web-query sanitization ----------------------
 _PY_FENCE_RE = re.compile(r"```(?:python)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
 _PY_LINE_SIG = re.compile(
@@ -535,6 +604,7 @@ _PY_LINE_SIG = re.compile(
     ^\s*(?:from\s+\w[\w\.]*\s+import\s+|import\s+\w[\w\.]*\s*|print\s*\(|def\s+\w+\s*\(|class\s+\w+\s*\(|for\s+\w+\s+in\s+|while\s+|if\s+__name__\s*==\s*['"]__main__['"])
     """
 )
+
 
 def _extract_python_code(text: str) -> Optional[str]:
     if not text:
@@ -551,6 +621,7 @@ def _extract_python_code(text: str) -> Optional[str]:
         return text.strip()
     return None
 
+
 def _sanitize_web_query(text: str) -> str:
     if not text:
         return ""
@@ -561,15 +632,95 @@ def _sanitize_web_query(text: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:200]
 
+
 # ---------------------- API ----------------------
+@app.post("/rag/upload")
+async def rag_upload(
+        request: Request,
+        # Accept BOTH "files" (multi) and "file" (single)
+        files: Optional[List[UploadFile]] = File(None, alias="files"),
+        file: Optional[UploadFile] = File(None, alias="file"),
+        # Accept scope and chat_id from query OR from form-data
+        scope_q: Optional[str] = Query(None),
+        scope_f: Optional[str] = Form(None),
+        chat_id_q: Optional[int] = Query(None),
+        chat_id_f: Optional[int] = Form(None),
+        db_user: Optional[User] = Depends(current_user_dep),
+):
+    """
+    Upload TXT/PDF/DOCX/MD → chunk+embed → add to Chroma under user or chat namespace.
+
+    - Provide files as:
+        • multiple: "files" (repeat the key for each file)
+        • single:   "file"
+    - Provide scope/chat_id either as query params or as form-data fields:
+        • scope: "user" (default) or "chat"
+        • chat_id: required when scope == "chat"
+    """
+    if not db_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Gather uploads into one list
+    uploads: List[UploadFile] = []
+    if files:
+        uploads.extend(files)
+    if file:
+        uploads.append(file)
+    if not uploads:
+        raise HTTPException(status_code=400, detail='No files provided. Use "files" (multi) or "file" (single).')
+
+    # Resolve scope/chat_id from query OR form
+    scope = (scope_q or scope_f or "user").strip().lower()
+    if scope not in ("user", "chat"):
+        raise HTTPException(status_code=422, detail='Invalid "scope". Use "user" or "chat".')
+
+    chat_id = chat_id_q if chat_id_q is not None else chat_id_f
+    if scope == "chat" and chat_id is None:
+        raise HTTPException(status_code=422, detail='"chat_id" is required when scope="chat".')
+
+    ns_user = str(db_user.id) if scope == "user" else None
+    ns_chat = str(chat_id) if scope == "chat" else None
+
+    total_chunks = 0
+    accepted: List[str] = []
+    rejected: List[str] = []
+
+    for f in uploads:
+        try:
+            data = await f.read()
+            added = ingest_bytes(
+                filename=f.filename,
+                data=data,
+                user_id=ns_user,
+                chat_id=ns_chat,
+            )
+            if added > 0:
+                total_chunks += added
+                accepted.append(f.filename)
+            else:
+                rejected.append(f.filename)
+        except Exception:
+            rejected.append(f.filename)
+
+    return {
+        "ok": True,
+        "scope": scope,
+        "chat_id": ns_chat,
+        "files_received": len(uploads),
+        "files_indexed": len(accepted),
+        "files_skipped": rejected,
+        "chunks": total_chunks,
+    }
+
+
 @app.get("/chat/stream")
 async def chat_stream(
-    q: str = Query(..., description="User query"),
-    mode: str = Query("auto", pattern="^(auto|none|dense|rerank|web)$"),
-    cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
-    chat_id: Optional[int] = Query(None, ge=1),  # persisted chat id (authenticated)
-    scope: str = Query("user", pattern="^(user|chat)$"),  # retrieval namespace scope
-    request: Request = None,  # to identify current user
+        q: str = Query(..., description="User query"),
+        mode: str = Query("auto", pattern="^(auto|none|dense|rerank|web)$"),
+        cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
+        chat_id: Optional[int] = Query(None, ge=1),  # persisted chat id (authenticated)
+        scope: str = Query("user", pattern="^(user|chat)$"),  # retrieval namespace scope
+        request: Request = None,  # to identify current user
 ):
     """
     Modes:
@@ -583,6 +734,7 @@ async def chat_stream(
       - scope=user : retrieval filtered to the current user_id (if logged-in)
       - scope=chat : retrieval filtered to this chat_id (must provide chat_id; falls back to user if missing)
     """
+
     async def gen() -> AsyncGenerator[bytes, None]:
         try:
             lang = "Hebrew" if is_hebrew(q) else "English"
@@ -772,7 +924,8 @@ async def chat_stream(
                     )
                 else:
                     prompt = build_prompt_single(
-                        q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note, history_text=history_text
+                        q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note,
+                        history_text=history_text
                     )
 
             else:  # auto
@@ -803,9 +956,9 @@ async def chat_stream(
                     text0 = (rag_docs[0].get("text") or "").lower()
                     rag_overlap = sum(1 for k in rag_keywords if k in text0)
                 rag_strong = (rag_overlap >= 1) or (
-                    rag_docs
-                    and isinstance(rag_docs[0].get("distance", 1.0), (int, float))
-                    and float(rag_docs[0]["distance"]) < 0.55
+                        rag_docs
+                        and isinstance(rag_docs[0].get("distance", 1.0), (int, float))
+                        and float(rag_docs[0]["distance"]) < 0.55
                 )
 
                 ctx_web = {"context_text": "", "citations": []}
@@ -835,7 +988,8 @@ async def chat_stream(
                         trace_id,
                         "web_search",
                         {"query": sanitized or "(skipped)"},
-                        {"provider": provider, "count": len(items), "debug": debug + [f"timed_out={1 if timed_out else 0}"], "items": items},
+                        {"provider": provider, "count": len(items),
+                         "debug": debug + [f"timed_out={1 if timed_out else 0}"], "items": items},
                     )
                     ctx_web = build_web_context(q, items)
 
@@ -885,6 +1039,7 @@ async def chat_stream(
     }
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
+
 @app.post("/chats/{chat_id}/auto-title")
 async def auto_title(chat_id: int, request: Request, db=Depends(get_db)):
     """
@@ -894,7 +1049,6 @@ async def auto_title(chat_id: int, request: Request, db=Depends(get_db)):
     """
     # Deps/typing (keep local to avoid file-wide import churn)
     from sqlalchemy.ext.asyncio import AsyncSession
-    from sqlalchemy import select
 
     assert isinstance(db, AsyncSession)
 
@@ -935,4 +1089,3 @@ async def auto_title(chat_id: int, request: Request, db=Depends(get_db)):
     await db.commit()
 
     return {"id": chat.id, "title": chat.title}
-

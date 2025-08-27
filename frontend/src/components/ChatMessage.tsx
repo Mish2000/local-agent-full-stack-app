@@ -1,14 +1,12 @@
 // src/components/ChatMessage.tsx
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Markdown from "../lib/markdown";
 import { detectDir, type Dir } from "../lib/text";
 
 /** ------------------------------------------------------------------
- *  Non-breaking math in plain text (outside code):
- *  - Keeps tiny expressions like: n-1, a + b, x/y, 2^k, (n-1), a*b, a×b, a÷b on one line.
- *  - Does NOT touch fenced or inline code; inline code is handled via CSS (nowrap).
+ *  Keep tiny math-like expressions readable in plain text (outside code).
+ *  Does NOT touch fenced or inline code.
  *  ------------------------------------------------------------------ */
-
 const NBSP = "\u00A0";   // non-breaking space
 const NBH  = "\u2011";   // non-breaking hyphen
 
@@ -23,19 +21,36 @@ function protectOperatorsChunk(chunk: string): string {
         .replace(/([A-Za-z0-9)])\s*÷\s*([A-Za-z0-9(])/g, `$1${NBSP}÷${NBSP}$2`);
 }
 
-function protectAtomicMathOutsideCode(text: string): string {
-    const re = /```[\s\S]*?```|`[^`]*`/g;
-    let out = "";
-    let last = 0;
-    let m: RegExpExecArray | null;
+/**
+ * Normalize Markdown fences live while streaming:
+ *  - If model writes "```lang <code>" on one line, insert a newline after the lang.
+ *  - Never touch content inside code fences.
+ */
+function normalizeAndProtect(text: string): string {
+    // 1) normalize newlines and ensure "```lang\n" (so the parser recognizes the language immediately)
+    const normalized = text
+        .replace(/\r\n/g, "\n")
+        .replace(/```([A-Za-z0-9_+-]+)[ \t]+(?=\S)/g, "```$1\n");
 
-    while ((m = re.exec(text))) {
-        const before = text.slice(last, m.index);
-        out += protectOperatorsChunk(before); // transform plain text
-        out += m[0];                          // keep code AS-IS
-        last = m.index + m[0].length;
+    // 2) protect only the non-code parts with NBSP/NBH tweaks
+    let out = "";
+    let i = 0;
+    while (true) {
+        const start = normalized.indexOf("```", i);
+        if (start === -1) {
+            out += protectOperatorsChunk(normalized.slice(i));
+            break;
+        }
+        out += protectOperatorsChunk(normalized.slice(i, start));
+        const fenceEnd = normalized.indexOf("```", start + 3);
+        if (fenceEnd === -1) {
+            // open fence: copy the rest untouched (it's code that is still streaming)
+            out += normalized.slice(start);
+            break;
+        }
+        out += normalized.slice(start, fenceEnd + 3);
+        i = fenceEnd + 3;
     }
-    out += protectOperatorsChunk(text.slice(last));
     return out;
 }
 
@@ -46,9 +61,10 @@ type Props = {
 };
 
 export default function ChatMessage({ id, role, content }: Props) {
-    const [copied, setCopied] = useState(false); // hooks at top-level (no lint warning)
+    const [copied, setCopied] = useState(false);
     const dir: Dir = detectDir(content);
-    const processed = useMemo(() => protectAtomicMathOutsideCode(content), [content]);
+    const processed = useMemo(() => normalizeAndProtect(content), [content]);
+    const containerRef = useRef<HTMLDivElement | null>(null);
 
     const copyAll = async () => {
         try {
@@ -78,6 +94,7 @@ export default function ChatMessage({ id, role, content }: Props) {
     return (
         <div
             id={id}
+            ref={containerRef}
             className="msg assistant group"
             dir={dir}
             style={{
@@ -85,37 +102,26 @@ export default function ChatMessage({ id, role, content }: Props) {
                 marginLeft: "auto",
                 maxWidth: "80ch",
                 position: "relative",
+                // reserve a bit of room so the toolbar never overlaps text
+                paddingTop: 36
             }}
             role="article"
             aria-label="Assistant message"
         >
-            {/* Inline code should never wrap, but code blocks must preserve newlines. */}
-            <style>{`
-        /* inline code: only when <code> is NOT inside a <pre> */
-        .msg.assistant :not(pre) > code { white-space: nowrap !important; }
-        /* fenced code blocks: preserve line breaks (and allow horizontal scroll for long lines) */
-        .msg.assistant pre { white-space: pre !important; }
-        .msg.assistant pre code { white-space: inherit !important; display: block; }
-      `}</style>
-
-            {/* Hover/focus toolbar */}
-            <div
-                className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                role="toolbar"
-                aria-label="Message actions"
-            >
+            {/* Floating toolbar (copy whole answer) */}
+            <div className="msg-toolbar" role="toolbar" aria-label="Message actions" data-no-copy>
                 <button
                     type="button"
                     onClick={copyAll}
-                    className="h-7 rounded-md border px-2 text-xs hover:bg-[var(--hover)] focus:opacity-100 focus:outline-none"
+                    className="msg-toolbar-btn"
                     title="Copy entire answer"
                     aria-label="Copy entire answer"
                 >
-                    {copied ? "Copied!" : "Copy"}
+                    {copied ? "Copied!" : "Copy answer"}
                 </button>
             </div>
 
-            {/* Render with non-breaking math applied */}
+            {/* Render prose + fenced code; CSS + the CodeBlock component will keep newlines live. */}
             <Markdown text={processed} />
         </div>
     );

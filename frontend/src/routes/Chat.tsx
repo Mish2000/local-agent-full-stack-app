@@ -1,5 +1,5 @@
 // src/routes/Chat.tsx
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openChatSSE, type RagMode, type Source, type ToolEvent } from "@/lib/sse";
 import Header from "@/components/Header";
 import ChatMessage from "@/components/ChatMessage";
@@ -11,6 +11,12 @@ import { type Dir, detectDir, looksLikeCode } from "@/lib/text";
 import { ArrowDown } from "lucide-react";
 import { toast } from "sonner";
 import Sidebar from "@/components/Sidebar";
+import UploadDocs from "@/components/UploadDocs";
+import ExportPDF from "@/components/ExportPDF";
+import { usePerChatMode } from "@/lib/usePerChatMode";
+import { setChatMode } from "@/lib/modeStorage";
+import { saveLastForChat, loadLastForChat, clearLastForChat } from "@/lib/reasoningStorage";
+
 import {
     createChat,
     deleteChat,
@@ -36,12 +42,15 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     const isGuest = variant === "guest";
     const { me } = useAuth();
 
-    const [backendStatus, setBackendStatus] = useState<string>("checking...");
     const [messages, setMessages] = useState<Msg[]>([]);
     const [streaming, setStreaming] = useState(false);
 
+    // Guest is hard-forced to 'none'; authenticated users persist per-chat mode.
     const forcedMode: RagMode | null = isGuest ? "none" : null;
-    const [ragMode, setRagMode] = useState<RagMode>(forcedMode ?? "none");
+
+    // Per-conversation mode (persisted in localStorage by chat id).
+    const [activeChatId, setActiveChatId] = useState<number | null>(null);
+    const [ragMode, setRagMode] = usePerChatMode(activeChatId ? String(activeChatId) : null);
 
     const [lastSources, setLastSources] = useState<Source[] | null>(null);
     const [lastTools, setLastTools] = useState<ToolEvent[]>([]);
@@ -50,14 +59,13 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     const [cid, setCid] = useState<string>(() => (isGuest ? makeCid() : ""));
 
     const [chats, setChats] = useState<ChatSummary[]>([]);
-    const [activeChatId, setActiveChatId] = useState<number | null>(null);
     const [loadingChats, setLoadingChats] = useState<boolean>(!isGuest);
 
-    // When we create the chat at first send, we remember it here for auto-rename
     const firstTurnTitlePendingRef = useRef<{ chatId: number | null; firstUserText: string | null }>({
         chatId: null,
         firstUserText: null,
     });
+    const suppressNextLoadRef = useRef<boolean>(false);
 
     const headerRef = useRef<HTMLElement | null>(null);
     const composerH = useRef<number>(96);
@@ -66,18 +74,16 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     const viewportRef = useRef<HTMLDivElement | null>(null);
     const chatRef = useRef<HTMLDivElement | null>(null);
     const esRef = useRef<EventSource | null>(null);
+    /** Track which chat the current SSE belongs to (prevents auto-closing the just-opened stream). */
+    const esChatIdRef = useRef<number | null>(null);
 
     const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
     const [showJumpDown, setShowJumpDown] = useState(false);
     const [jumpBtnBottom, setJumpBtnBottom] = useState<number>(84);
 
-    // ------- Backend status -------
-    useEffect(() => {
-        fetch("http://localhost:8000/healthz")
-            .then((r) => r.json())
-            .then((j) => setBackendStatus(j.status ?? "unknown"))
-            .catch(() => setBackendStatus("backend unreachable"));
-    }, []);
+    // Sources per assistant message index (used for PDF export)
+    const [sourcesByIdx, setSourcesByIdx] = useState<Record<number, Source[]>>({});
+    const currentAssistantIndexRef = useRef<number | null>(null);
 
     // ------- Layout -------
     const layoutViewport = useCallback(() => {
@@ -154,22 +160,22 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         });
     }, [messages.length, pendingScrollId, recomputeBottomState]);
 
-    // ------- Load existing chats (do NOT auto-create; show blank on entry) -------
+    // ------- Load existing chats -------
     useEffect(() => {
         if (isGuest) return;
         let cancelled = false;
-
         (async () => {
             try {
                 setLoadingChats(true);
                 const existing = await listChats();
                 if (cancelled) return;
                 setChats(existing);
-                setActiveChatId(null); // fresh blank screen on entry
+                setActiveChatId(null);
                 setMessages([]);
                 setLastSources(null);
                 setLastTools([]);
                 setLastTraceId(null);
+                setSourcesByIdx({});
             } catch (e) {
                 console.error(e);
                 toast.error("Failed to load chats");
@@ -177,25 +183,46 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                 if (!cancelled) setLoadingChats(false);
             }
         })();
-
         return () => {
             cancelled = true;
         };
     }, [isGuest, me?.id]);
 
-    // --- Load messages for the selected chat (but NEVER during streaming) ---
+    // --- When the active chat changes, hydrate last steps/sources/trace.
+    //     Only close an existing SSE if it's for a DIFFERENT chat.
     useEffect(() => {
-        // Guest mode has no server-side messages list
-        if (variant !== "full") return;
-
-        // While streaming, we MUST NOT reload, or we’ll erase the assistant placeholder
-        if (streaming) return;
+        if (esRef.current && esChatIdRef.current !== activeChatId) {
+            esRef.current.close();
+            esRef.current = null;
+            setStreaming(false);
+        }
 
         if (!activeChatId) {
-            setMessages([]);
             setLastSources(null);
             setLastTools([]);
             setLastTraceId(null);
+            setSourcesByIdx({});
+            return;
+        }
+
+        const cached = loadLastForChat(activeChatId);
+        setLastTools(cached?.tools ?? []);
+        setLastSources((cached?.sources?.length ?? 0) ? cached!.sources : null);
+        setLastTraceId(cached?.traceId ?? null);
+        setSourcesByIdx({});
+    }, [activeChatId]);
+
+    // --- Load messages for the selected chat ---
+    useEffect(() => {
+        if (variant !== "full") return;
+
+        if (!activeChatId) {
+            setMessages([]);
+            return;
+        }
+
+        if (suppressNextLoadRef.current) {
+            suppressNextLoadRef.current = false;
             return;
         }
 
@@ -204,11 +231,12 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             try {
                 const rows = await listMessages(activeChatId);
                 if (cancelled) return;
-                const msgs = rows.map<Msg>((r) => ({ role: r.role, content: r.content, dir: detectDir(r.content) }));
+                const msgs = rows.map<Msg>((r) => ({
+                    role: r.role,
+                    content: r.content,
+                    dir: detectDir(r.content),
+                }));
                 setMessages(msgs);
-                setLastSources(null);
-                setLastTools([]);
-                setLastTraceId(null);
             } catch (e) {
                 console.error(e);
                 toast.error("Failed to load messages");
@@ -218,31 +246,66 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         return () => {
             cancelled = true;
         };
-        // IMPORTANT: depend on `streaming` as well
-    }, [variant, activeChatId, streaming]);
+    }, [variant, activeChatId]);
+
+    // --- After messages change, attach cached sources to the latest assistant msg (for Export PDF)
+    useEffect(() => {
+        if (!activeChatId) return;
+        if (!lastSources || lastSources.length === 0) return;
+        if (!messages.length) return;
+
+        let lastAssistantIdx: number | null = null;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === "assistant") {
+                lastAssistantIdx = i;
+                break;
+            }
+        }
+        if (lastAssistantIdx == null) return;
+
+        setSourcesByIdx((prev) => {
+            if (prev[lastAssistantIdx!] && prev[lastAssistantIdx!].length) return prev;
+            return { ...prev, [lastAssistantIdx!]: lastSources };
+        });
+    }, [messages, lastSources, activeChatId]);
+
+    // --- Persist last steps/sources/trace changes to sessionStorage (per chat)
+    useEffect(() => {
+        if (!activeChatId) return;
+        if (lastTools.length === 0 && !lastSources && !lastTraceId) {
+            clearLastForChat(activeChatId);
+            return;
+        }
+        saveLastForChat(activeChatId, {
+            tools: lastTools,
+            sources: lastSources ?? [],
+            traceId: lastTraceId ?? null,
+        });
+    }, [activeChatId, lastTools, lastSources, lastTraceId]);
 
     // ------- Send message -------
     const handleSend = async (text: string, kbdDir: Dir) => {
         if (streaming) return;
 
-        // For authenticated users: if no active chat yet, create it NOW (first prompt)
         let ensureChatId: number | undefined = activeChatId ?? undefined;
         if (!isGuest && !ensureChatId) {
             try {
-                // minimal placeholder; will be auto-titled when first assistant reply completes
+                // Create the chat only on first user message of the session
                 const created = await createChat("…");
+                suppressNextLoadRef.current = true;
                 ensureChatId = created.id;
                 setChats((prev) => [created, ...prev]);
                 setActiveChatId(created.id);
-                // mark this chat for auto-title after first assistant message
+
+                // Persist the *currently selected* mode for this new chat (fixes auto-reset-to-none bug).
+                setChatMode(String(created.id), forcedMode ?? ragMode);
+
                 firstTurnTitlePendingRef.current = { chatId: created.id, firstUserText: text };
-                // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            } catch (e) {
+            } catch {
                 toast.error("Failed to start a new chat");
                 return;
             }
         } else {
-            // If this is the first message of an already-selected (empty) chat, set pending rename
             if (!isGuest && messages.length === 0 && ensureChatId) {
                 firstTurnTitlePendingRef.current = { chatId: ensureChatId, firstUserText: text };
             } else {
@@ -250,17 +313,29 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             }
         }
 
+        // Clear last turn panels immediately for this chat to avoid stale display.
         setLastSources(null);
         setLastTools([]);
         setLastTraceId(null);
+        if (ensureChatId) clearLastForChat(ensureChatId);
 
-        const userIdx = messages.length;
+        const assistantIdx = messages.length + 1;
+        currentAssistantIndexRef.current = assistantIdx;
+
         const userMsg: Msg = { role: "user", content: text, dir: kbdDir };
         const assistantMsg: Msg = { role: "assistant", content: "", dir: kbdDir };
-
         setMessages((prev) => [...prev, userMsg, assistantMsg]);
-        setPendingScrollId(`msg-${userIdx}`);
+        setPendingScrollId(`msg-${assistantIdx}`);
         setStreaming(true);
+
+        setSourcesByIdx((prev) => {
+            const next = { ...prev };
+            delete next[assistantIdx];
+            return next;
+        });
+
+        // Mark which chat the SSE belongs to (so the activeChatId effect won't kill it).
+        esChatIdRef.current = !isGuest ? (ensureChatId ?? null) : null;
 
         esRef.current = openChatSSE(
             text,
@@ -268,33 +343,34 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                 onToken: (t) => {
                     setMessages((prev) => {
                         const next = [...prev];
-                        const lastIdx = next.length - 1;
-                        if (lastIdx >= 0 && next[lastIdx].role === "assistant") {
-                            const combined = next[lastIdx].content + t;
+                        const last = next.length - 1;
+                        if (last >= 0 && next[last].role === "assistant") {
+                            const combined = next[last].content + t;
                             const dir: Dir = looksLikeCode(combined) ? "ltr" : detectDir(combined);
-                            next[lastIdx] = { ...next[lastIdx], content: combined, dir };
+                            next[last] = { ...next[last], content: combined, dir };
                         }
                         return next;
                     });
                 },
-                onSources: (arr) => setLastSources(arr),
+                onSources: (arr) => {
+                    setLastSources(arr);
+                    const idx = currentAssistantIndexRef.current;
+                    if (typeof idx === "number") {
+                        setSourcesByIdx((prev) => ({ ...prev, [idx]: arr }));
+                    }
+                },
                 onTool: (ev) => setLastTools((prev) => [...prev, ev]),
                 onTrace: (id) => setLastTraceId(id),
-                // NOTE: onDone takes NO arguments per SSEHandlers; do not destructure anything here.
                 onDone: () => {
                     setStreaming(false);
-
-                    // If this was the first turn of a brand-new chat, ask the backend to auto-title it
                     const pending = firstTurnTitlePendingRef.current;
                     if (!isGuest && pending.chatId && pending.firstUserText) {
                         (async () => {
                             try {
                                 const res = await autoTitle(pending.chatId!);
-                                // reflect the new title in the sidebar
                                 setChats((prev) => prev.map((c) => (c.id === res.id ? { ...c, title: res.title } : c)));
                             } catch (e) {
                                 console.warn("auto-title failed:", e);
-                                // it's okay if this fails; we keep the default name
                             } finally {
                                 firstTurnTitlePendingRef.current = { chatId: null, firstUserText: null };
                             }
@@ -318,6 +394,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     useEffect(() => {
         return () => {
             if (esRef.current) esRef.current.close();
+            esChatIdRef.current = null;
         };
     }, []);
 
@@ -335,8 +412,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         }
     };
 
-    const doNewChat = () => {
-        // Do NOT create on click. Just show a fresh blank screen.
+    const doNewChat = useCallback(() => {
         if (isGuest) {
             setCid(makeCid());
         }
@@ -345,9 +421,10 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         setLastSources(null);
         setLastTools([]);
         setLastTraceId(null);
-    };
+        setSourcesByIdx({});
+        // Note: no chat id yet -> mode naturally shows 'none' via usePerChatMode(null)
+    }, [isGuest]);
 
-    // Global Cmd/Ctrl+K => new blank chat (does NOT create a DB row yet)
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
@@ -358,7 +435,6 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
     }, [doNewChat]);
-
 
     const doRenameChat = async (id: number) => {
         const current = chats.find((c) => c.id === id);
@@ -380,6 +456,11 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             if (activeChatId === id) {
                 setActiveChatId(null);
                 setMessages([]);
+                setSourcesByIdx({});
+                setLastSources(null);
+                setLastTools([]);
+                setLastTraceId(null);
+                clearLastForChat(id);
             }
         } catch {
             toast.error("Delete failed");
@@ -393,14 +474,19 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             setLastSources(null);
             setLastTools([]);
             setLastTraceId(null);
+            setSourcesByIdx({});
         }
     };
+
+    const activeTitle = useMemo(
+        () => (!isGuest ? chats.find((c) => c.id === activeChatId)?.title ?? "שיחה" : "שיחה"),
+        [chats, activeChatId, isGuest]
+    );
 
     return (
         <div className="min-h-dvh">
             <Header
                 ref={headerRef}
-                backendStatus={backendStatus}
                 ragMode={forcedMode ?? ragMode}
                 onChangeMode={setRagMode}
                 onNewChat={doNewChat}
@@ -424,6 +510,16 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
 
                     {/* Messages scroller */}
                     <div ref={chatRef} className="chat flex-1 min-w-0 px-4">
+                        {/* sticky tools row at top */}
+                        <div className="sticky top-2 z-10 flex justify-end gap-2 pr-1 pb-2">
+                            {!isGuest && <UploadDocs chatId={activeChatId} />}
+                            <ExportPDF
+                                chatTitle={activeTitle}
+                                messages={messages.map((m) => ({ role: m.role, content: m.content }))}
+                                sourcesByIndex={sourcesByIdx}
+                            />
+                        </div>
+
                         {!isGuest && loadingChats && <div className="opacity-70 py-4">טוען היסטוריית שיחות…</div>}
 
                         {/* Blank state when no chat selected (or new chat draft) */}
@@ -439,6 +535,8 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                         {messages.map((m, idx) => (
                             <ChatMessage key={idx} id={`msg-${idx}`} role={m.role} content={m.content} />
                         ))}
+
+                        {/* Trace + Reasoning steps + Sources are inside the scroller */}
                         <TracesBar traceId={lastTraceId} />
                         {lastTools.length > 0 && <ToolCalls items={lastTools} />}
                         {lastSources && lastSources.length > 0 && <SourcesBar items={lastSources} />}
@@ -446,7 +544,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                 </div>
             </div>
 
-            {/* Jump-to-bottom floating button */}
+            {/* Jump-to-bottom floating button (CSS places it on the left) */}
             {showJumpDown && (
                 <button
                     className="jump-down"

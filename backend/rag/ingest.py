@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
+import os, tempfile
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
 
 # Silence Chroma telemetry
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
@@ -28,6 +31,77 @@ DOCX_EXTS = {".docx"}
 PDF_EXTS = {".pdf"}
 
 # ---------------- File readers ----------------
+def ingest_bytes(
+    *,
+    filename: str,
+    data: bytes,
+    user_id: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    collection: str = CHROMA_COLLECTION,
+) -> int:
+    """
+    Index a single uploaded file into Chroma (scoped by user_id and/or chat_id).
+    Returns the number of chunks added.
+    """
+    # 1) Persist to a temp file so our existing loaders can handle pdf/docx/txt
+    suffix = Path(filename).suffix or ".txt"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.write(fd, data)
+    os.close(fd)
+
+    try:
+        p = Path(tmp_path)
+        text = load_file(p)
+        if not (text and text.strip()):
+            return 0
+
+        chunks = chunk_text(text)
+        if not chunks:
+            return 0
+
+        # 2) Open Chroma collection + embedder (same models/env you already use)
+        client = chromadb.PersistentClient(
+            path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False)
+        )
+        coll = client.get_or_create_collection(collection)
+        embedder = SentenceTransformer(EMBED_MODEL_NAME)
+
+        # 3) Build batch
+        ids: List[str] = []
+        docs: List[str] = []
+        metas: List[Dict[str, Any]] = []
+
+        for idx, (ck, start_line, end_line) in enumerate(chunks, start=1):
+            doc_id = sha1(f"{filename}:{start_line}-{end_line}:{ck[:48]}")
+            ids.append(doc_id)
+            docs.append(ck)
+            meta: Dict[str, Any] = {
+                "source": filename,
+                "chunk": idx,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+            if user_id:
+                meta["user_id"] = str(user_id)
+            if chat_id:
+                meta["chat_id"] = str(chat_id)
+            metas.append(meta)
+
+        # 4) Embed once per file and upsert
+        vectors = embedder.encode(docs, normalize_embeddings=True).tolist()
+        if hasattr(coll, "upsert"):
+            coll.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vectors)
+        else:
+            coll.add(ids=ids, documents=docs, metadatas=metas, embeddings=vectors)
+
+        return len(docs)
+
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
 def read_text_file(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
