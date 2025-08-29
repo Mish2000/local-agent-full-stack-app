@@ -1,3 +1,4 @@
+// src/lib/markdown.tsx
 import * as React from "react";
 import { splitFences } from "@/lib/markdownUtils";
 
@@ -15,7 +16,7 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1200);
         } catch {
-            // Silent fallback: on rare old browsers without clipboard API we just do nothing
+            // ignore
         }
     };
 
@@ -33,7 +34,12 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
                     {copied ? "Copied!" : "Copy"}
                 </button>
             </div>
-            <pre className="overflow-x-auto p-3 text-sm leading-relaxed" data-lang={lang || ""} style={{ whiteSpace: "pre", margin: 0, tabSize: 4 }}>
+            <pre
+                dir="ltr"
+                className="overflow-x-auto p-3 text-sm leading-relaxed"
+                data-lang={lang || ""}
+                style={{ whiteSpace: "pre", margin: 0, tabSize: 4 }}
+            >
         <code
             style={{
                 display: "block",

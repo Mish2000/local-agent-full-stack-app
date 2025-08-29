@@ -1,8 +1,8 @@
 // src/components/UploadDocs.tsx
 import * as React from "react";
-import { uploadDocs } from "@/lib/api";
+import { uploadDocs, listFiles, deleteFile, type FileItem } from "@/lib/api";
 import { toast } from "sonner";
-import { Upload, Paperclip, X } from "lucide-react";
+import { Upload, Paperclip, X, Trash2 } from "lucide-react";
 
 type Props = {
     /** If a chat is active we default to "chat" scope, otherwise "user" */
@@ -12,9 +12,23 @@ type Props = {
 export default function UploadDocs({ chatId }: Props) {
     const [busy, setBusy] = React.useState(false);
     const [showOverlay, setShowOverlay] = React.useState(false);
+    const [items, setItems] = React.useState<FileItem[]>([]);
     const inputRef = React.useRef<HTMLInputElement | null>(null);
 
     const scope: "user" | "chat" = chatId ? "chat" : "user";
+
+    const refresh = React.useCallback(async () => {
+        try {
+            const data = await listFiles(scope, chatId ?? undefined);
+            setItems(data);
+        } catch {
+            setItems([]);
+        }
+    }, [scope, chatId]);
+
+    React.useEffect(() => {
+        void refresh();
+    }, [refresh]);
 
     const pickFiles = React.useCallback(() => {
         inputRef.current?.click();
@@ -30,6 +44,7 @@ export default function UploadDocs({ chatId }: Props) {
                     const okCnt = resp.files_indexed ?? 0;
                     const skip = (resp.files_skipped ?? []).join(", ");
                     toast.success(`Indexed ${okCnt} file${okCnt === 1 ? "" : "s"}${skip ? ` (skipped: ${skip})` : ""}`);
+                    await refresh();
                 } else {
                     toast.error("Upload failed");
                 }
@@ -40,7 +55,7 @@ export default function UploadDocs({ chatId }: Props) {
                 setShowOverlay(false);
             }
         },
-        [scope, chatId]
+        [scope, chatId, refresh]
     );
 
     // Global drag listeners to show an overlay anywhere in the app
@@ -75,6 +90,16 @@ export default function UploadDocs({ chatId }: Props) {
         };
     }, [doUpload, showOverlay]);
 
+    const onDelete = async (id: number) => {
+        try {
+            await deleteFile(id);
+            toast.success("Deleted");
+            await refresh();
+        } catch (e: unknown) {
+            toast.error(e instanceof Error ? e.message : "Delete failed");
+        }
+    };
+
     return (
         <>
             {/* Tiny, neat action chip */}
@@ -98,6 +123,37 @@ export default function UploadDocs({ chatId }: Props) {
                     className="hidden"
                     onChange={(e) => void doUpload(e.currentTarget.files)}
                 />
+            </div>
+
+            {/* Attached files list */}
+            <div className="mt-3 rounded-xl border p-3 bg-[var(--panel)]">
+                <div className="text-sm font-semibold mb-2">
+                    {scope === "chat" ? "Files in this chat" : "Your uploaded docs"} ({items.length})
+                </div>
+                {items.length === 0 ? (
+                    <div className="text-xs opacity-70">No files yet.</div>
+                ) : (
+                    <ul className="space-y-2">
+                        {items.map((f) => (
+                            <li key={f.id} className="flex items-center justify-between text-sm">
+                                <div className="truncate" title={f.filename}>
+                                    {f.filename}
+                                    {typeof f.size_bytes === "number" ? (
+                                        <span className="opacity-60 text-xs"> · {f.size_bytes} bytes</span>
+                                    ) : null}
+                                </div>
+                                <button
+                                    className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs"
+                                    onClick={() => onDelete(f.id)}
+                                    aria-label={`Delete ${f.filename}`}
+                                >
+                                    <Trash2 className="size-3.5" />
+                                    Delete
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                )}
             </div>
 
             {/* Drop overlay */}
