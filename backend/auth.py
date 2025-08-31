@@ -1,19 +1,21 @@
 # backend/auth.py
 from __future__ import annotations
-import os, secrets, datetime as dt
+
+import datetime as dt
+import os
+import secrets
 from typing import Optional
+
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 from fastapi import APIRouter, Depends, HTTPException, Response, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
 
 from db import SessionLocal
-from models import User, Session
-
-from sqlalchemy import update
 from models import PasswordReset
+from models import User, Session
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

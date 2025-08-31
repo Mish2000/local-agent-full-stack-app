@@ -1,3 +1,4 @@
+// src/routes/Forgot.tsx
 import React, { useState } from "react";
 import { Link } from "react-router-dom";
 import { Input } from "@/components/ui/input";
@@ -7,6 +8,7 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { validateEmail } from "@/lib/validators";
 import { Sparkles } from "lucide-react";
+import { APP_NAME } from "@/config/app";
 
 export default function Forgot() {
     const [email, setEmail] = useState("");
@@ -37,15 +39,15 @@ export default function Forgot() {
 
     return (
         <div className="min-h-dvh bg-[var(--bg)] text-[var(--text)] grid grid-rows-[auto_1fr]">
-            <header className="sticky top-0 z-40">
-                <div className="container py-3 flex items-center justify-between">
+            <header className="header sticky top-0 z-40">
+                <div className="container py-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
-                        <Sparkles className="size-5" />
-                        <h1 className="text-[20px] font-bold">Agent 2.0 — שחזור סיסמה</h1>
+                        <Sparkles className="size-5 opacity-80" />
+                        <h1 className="text-[20px] font-bold leading-tight">{APP_NAME} — שחזור סיסמה</h1>
                     </div>
                     <nav className="flex items-center gap-3">
-                        <Link to="/" className="hover:underline">בית</Link>
-                        <Link to="/login" className="hover:underline">התחברות</Link>
+                        <Link to="/" className="text-[15px] font-semibold hover:underline">בית</Link>
+                        <Link to="/login" className="text-[15px] font-semibold hover:underline">התחברות</Link>
                     </nav>
                 </div>
             </header>
@@ -57,7 +59,7 @@ export default function Forgot() {
                         <Input id="email" type="email" dir="ltr" inputMode="email" autoComplete="email"
                                placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
                     </div>
-                    <Button disabled={busy} className="h-11 rounded-2xl">{busy ? "שולח…" : "שלח קישור שחזור"}</Button>
+                    <Button disabled={busy} className="h-11 rounded-2xl">{busy ? "שולח…" : "שלח קישור לשחזור"}</Button>
 
                     {resetUrl && (
                         <div className="text-sm mt-2 p-3 rounded-xl border border-[var(--border)] bg-[var(--bg)]">

@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os, tempfile
+import os
+import tempfile
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
-import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
 
 # Silence Chroma telemetry
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
@@ -17,9 +15,8 @@ import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-# Optional readers (installable in dev)
-import docx2txt  # type: ignore
-from pypdf import PdfReader  # type: ignore
+import docx2txt
+from pypdf import PdfReader
 
 # ---- Config via env (keeps consistent with retriever.py) ----
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")

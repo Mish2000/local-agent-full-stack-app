@@ -9,6 +9,7 @@ import { api } from "@/lib/api";
 import { Sparkles } from "lucide-react";
 import { validateEmail } from "@/lib/validators";
 import { useAuth } from "@/lib/useAuth";
+import { APP_NAME } from "@/config/app";
 
 type Me = { id: number; email: string; display_name?: string | null };
 
@@ -38,7 +39,7 @@ export default function Login() {
                 method: "POST",
                 body: { email, password },
             });
-            await refresh(); // ensure /auth/me is set BEFORE route guard runs
+            await refresh();
             toast.success("מחובר! מעביר לצ'אט…");
             nav("/chat", { replace: true });
         } catch (err: unknown) {
@@ -51,15 +52,17 @@ export default function Login() {
 
     return (
         <div className="min-h-dvh bg-[var(--bg)] text-[var(--text)] grid grid-rows-[auto_1fr]">
-            <header className="sticky top-0 z-40">
-                <div className="container py-3 flex items-center justify-between">
+            <header className="header sticky top-0 z-40">
+                <div className="container py-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
-                        <Sparkles className="size-5" />
-                        <h1 className="text-[20px] font-bold">Agent 2.0 — התחברות</h1>
+                        <Sparkles className="size-5 opacity-80" />
+                        <h1 className="text-[20px] font-bold leading-tight">
+                            {APP_NAME} — התחברות
+                        </h1>
                     </div>
                     <nav className="flex items-center gap-3">
-                        <Link to="/" className="hover:underline">בית</Link>
-                        <Link to="/register" className="hover:underline">הרשמה</Link>
+                        <Link to="/" className="text-[15px] font-semibold hover:underline">בית</Link>
+                        <Link to="/register" className="text-[15px] font-semibold hover:underline">הרשמה</Link>
                     </nav>
                 </div>
             </header>

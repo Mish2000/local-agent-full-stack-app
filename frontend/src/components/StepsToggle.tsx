@@ -18,17 +18,6 @@ export default function StepsToggle() {
         } catch {
             /* ignore */
         }
-        // Notify listeners (ToolCalls subscribes to 'storage')
-        try {
-            window.dispatchEvent(
-                new StorageEvent("storage", {
-                    key: "show-reasoning-steps",
-                    newValue: enabled ? "1" : "0",
-                })
-            );
-        } catch {
-            /* ignore */
-        }
     }, [enabled]);
 
     return (
@@ -37,11 +26,11 @@ export default function StepsToggle() {
             size="sm"
             className="h-9 rounded-2xl"
             onClick={() => setEnabled((v) => !v)}
-            title="Show/Hide reasoning steps"
+            title={enabled ? "הסתרת צעדים" : "הצגת צעדים"}
             aria-pressed={enabled}
         >
-            {enabled ? <Eye className="size-4 mr-2" /> : <EyeOff className="size-4 mr-2" />}
-            {enabled ? "Steps: On" : "Steps: Off"}
+            {enabled ? <Eye className="size-4 ml-2" /> : <EyeOff className="size-4 ml-2" />}
+            {enabled ? "שלבים: פעיל" : "שלבים: כבוי"}
         </Button>
     );
 }

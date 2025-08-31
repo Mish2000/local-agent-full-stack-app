@@ -12,6 +12,7 @@ import Login from "./routes/Login";
 import Register from "./routes/Register";
 import Forgot from "./routes/Forgot";
 import ResetPassword from "./routes/ResetPassword";
+import Profile from "./routes/Profile";
 
 const router = createBrowserRouter([
     { path: "/", element: <AnonOnly><Landing /></AnonOnly> },
@@ -22,6 +23,7 @@ const router = createBrowserRouter([
     { path: "/forgot", element: <AnonOnly><Forgot /></AnonOnly> },
     { path: "/reset", element: <AnonOnly><ResetPassword /></AnonOnly> },
     { path: "*", element: <Navigate to="/" replace /> },
+    { path: "/profile/settings", element: <RequireAuth><Profile /></RequireAuth> },
 ]);
 
 document.documentElement.setAttribute("dir", "rtl");

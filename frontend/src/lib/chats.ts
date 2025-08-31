@@ -41,7 +41,19 @@ export async function listMessages(chatId: number): Promise<ChatMessageRow[]> {
     return api<ChatMessageRow[]>(`/chats/${chatId}/messages`);
 }
 
-export async function autoTitle(chatId: number): Promise<{ id: number; title: string }> {
-    return api<{ id: number; title: string }>(`/chats/${chatId}/auto-title`, { method: "POST" });
+export async function autoTitle(
+    chatId: number,
+    firstUserText?: string
+): Promise<{ id: number; title: string }> {
+    // Always send a small JSON body to keep proxies/CORS happy and avoid empty-body edge cases
+    const body = JSON.stringify({
+        first_user_text: (firstUserText ?? "").trim(),
+    });
+
+    return api<{ id: number; title: string }>(`/chats/${chatId}/auto-title`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+    });
 }
 

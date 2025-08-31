@@ -9,23 +9,31 @@ import subprocess
 import sys
 import time
 import uuid
+import logging
 from pathlib import Path
 from typing import AsyncGenerator, Dict, Tuple
-from typing import Optional, List
+from typing import List
+from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
+from aiomysql import sa
+from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI
-from fastapi import HTTPException, Depends, Request
-from fastapi import UploadFile, File, Form, Query, Body
+from fastapi import Form, Query, Body
+from fastapi import UploadFile, File, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import delete
 from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete
 
 from auth import get_db, _current_user
+from auth import ph  # reuse the Argon2 hasher from auth.py
 from auth import router as auth_router
 from db import init_db, Base, SessionLocal
 from eval.ragas_eval import run_evaluation, get_last_summary
@@ -33,6 +41,7 @@ from memory import memory
 from models import Chat, ChatMessage
 from models import FileMeta
 from models import User
+from models import UserProfile
 from rag.ingest import ingest_bytes
 from rag.retriever import Retriever
 from tracing import Tracer
@@ -72,7 +81,9 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 STAGED_DIR = Path(os.getenv("STAGED_DIR") or (Path(__file__).parent / "uploads_staged"))
 STAGED_DIR.mkdir(parents=True, exist_ok=True)
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".rst", ".csv", ".json", ".log"}
-
+AVATAR_DIR = UPLOAD_DIR / "avatars"
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+_ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
 
 
 def _is_local_ollama(url: str) -> bool:
@@ -152,6 +163,23 @@ async def ensure_ollama_running() -> None:
         print("[startup] Warning: OLLAMA did not become ready within 30s")
 
 
+logger = logging.getLogger(__name__)
+
+
+def ensure_windows_service_running(service: str) -> None:
+    """If on Windows and service not RUNNING, try to start it. Best-effort, never raises."""
+    if os.name != "nt":
+        return
+    try:
+        q = subprocess.run(["sc", "query", service], capture_output=True, text=True, check=False)
+        out = (q.stdout or "") + (q.stderr or "")
+        if "RUNNING" in out:
+            return
+        subprocess.run(["sc", "start", service], capture_output=True, text=True, check=False)
+    except Exception as e:
+        logger.warning("Failed to ensure Windows service %s is running: %s", service, e)
+
+
 async def current_user_dep(request: Request, db=Depends(get_db)) -> Optional[User]:
     # Delegate to your real helper
     return await _current_user(request, db)
@@ -215,6 +243,80 @@ def _list_staged_items(user_id: int, draft_id: str) -> list[dict]:
     return items
 
 
+async def _ensure_user_profile_columns(db: AsyncSession) -> None:
+    # avatar_kind
+    q1 = await db.execute(text("""
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'user_profiles'
+          AND COLUMN_NAME = 'avatar_kind'
+    """))
+    has_kind = (q1.scalar() or 0) > 0
+
+    # avatar_value
+    q2 = await db.execute(text("""
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'user_profiles'
+          AND COLUMN_NAME = 'avatar_value'
+    """))
+    has_value = (q2.scalar() or 0) > 0
+
+    # NEW: avatar_blob
+    q3 = await db.execute(text("""
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'user_profiles'
+          AND COLUMN_NAME = 'avatar_blob'
+    """))
+    has_blob = (q3.scalar() or 0) > 0
+
+    # NEW: avatar_mime
+    q4 = await db.execute(text("""
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'user_profiles'
+          AND COLUMN_NAME = 'avatar_mime'
+    """))
+    has_mime = (q4.scalar() or 0) > 0
+
+    # NEW: avatar_updated_at
+    q5 = await db.execute(text("""
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'user_profiles'
+          AND COLUMN_NAME = 'avatar_updated_at'
+    """))
+    has_updated = (q5.scalar() or 0) > 0
+
+    if not has_kind:
+        await db.execute(text("ALTER TABLE user_profiles ADD COLUMN avatar_kind VARCHAR(16) NOT NULL DEFAULT ''"))
+    if not has_value:
+        await db.execute(text("ALTER TABLE user_profiles ADD COLUMN avatar_value VARCHAR(255) NOT NULL DEFAULT ''"))
+    if not has_blob:
+        await db.execute(text("ALTER TABLE user_profiles ADD COLUMN avatar_blob LONGBLOB NULL"))
+    if not has_mime:
+        await db.execute(text("ALTER TABLE user_profiles ADD COLUMN avatar_mime VARCHAR(32) NOT NULL DEFAULT ''"))
+    if not has_updated:
+        await db.execute(text("ALTER TABLE user_profiles ADD COLUMN avatar_updated_at DATETIME(6) NULL"))
+
+    if (not has_kind) or (not has_value) or (not has_blob) or (not has_mime) or (not has_updated):
+        await db.commit()
+
+
+class ProfileAccountIn(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=120)
+    current_password: Optional[str] = Field(default=None, min_length=0, max_length=128)
+    new_password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+
+
+class ProfileSettingsIO(BaseModel):
+    instruction_enabled: bool = True
+    instruction_text: str = Field(default="", max_length=8000)
+    avatar_kind: str = Field(default="")  # "", "system", "upload"
+    avatar_value: str = Field(default="", max_length=255)
+
+
 # Tools
 from tools.web_search import WebSearcher
 from tools.py_eval import run_python
@@ -242,6 +344,7 @@ app.include_router(chats_router)
 @app.on_event("startup")
 async def _on_startup():
     await ensure_ollama_running()
+    ensure_windows_service_running("MySQL80")
     await init_db(Base)
 
 
@@ -392,6 +495,7 @@ def _title_prompt(first_user_text: str) -> str:
         "Output ONLY the title."
     )
 
+
 def _read_text_from_path(path: Path, max_chars: int = 6000) -> Optional[str]:
     try:
         data = path.read_bytes()
@@ -407,6 +511,7 @@ def _read_text_from_path(path: Path, max_chars: int = 6000) -> Optional[str]:
     if len(txt) > max_chars:
         txt = txt[: max_chars - 1] + "…"
     return txt
+
 
 async def _fallback_docs_for_chat(db: AsyncSession, user_id: int, chat_id: int,
                                   max_files: int = 3, per_file_chars: int = 6000) -> List[Dict]:
@@ -447,6 +552,25 @@ async def _fallback_docs_for_chat(db: AsyncSession, user_id: int, chat_id: int,
             "score": 1.0,
         })
     return out
+
+
+# --- Small helper to ensure a UserProfile row exists for the current user ---
+async def _get_or_create_profile(db: AsyncSession, user_id: int) -> UserProfile:
+    prof = await db.get(UserProfile, user_id)
+    if prof is None:
+        prof = UserProfile(
+            user_id=user_id,
+            instruction_enabled=True,
+            instruction_text="",
+            avatar_kind="",
+            avatar_value="",
+            avatar_blob=None,
+            avatar_mime="",
+            avatar_updated_at=None,
+        )
+        db.add(prof)
+        await db.commit()
+    return prof
 
 
 # ---------------------- Ollama stream ----------------------
@@ -659,27 +783,57 @@ def eval_ragas_last():
 
 
 # ---------------------- Guardrails & Prompt builders (history-aware) ----------------------
-def _base_system_prompt(lang: str, strict: bool = False, mode: str = "general",
-                        timed_out_note: Optional[str] = None) -> str:
+def _base_system_prompt(
+        lang: str,
+        strict: bool = False,
+        mode: str = "general",
+        timed_out_note: Optional[str] = None,
+        personal_extra: str = "",
+) -> str:
+    """
+    Build the base system prompt according to the selected mode.
+
+    - mode="web": prefer recency and credible sources from web context.
+    - mode="offline": never use the web; prefer local/personal context.
+    - other/general: neutral guidance.
+
+    When personal_extra is non-empty AND user enabled it in profile settings,
+    it is appended as "Personal instructions" so the LLM follows them globally.
+    """
     if strict:
         policy = (
             "Use ONLY the provided context. If it is insufficient or not relevant, say so briefly and do not invent content."
         )
     else:
-        policy = "Use the provided context IF relevant; if missing or insufficient, say so briefly. Be concise and avoid hallucinations."
+        policy = (
+            "Use the provided context IF relevant; if missing or insufficient, say so briefly. "
+            "Be concise and avoid hallucinations."
+        )
+
     web_note = ""
     if mode == "web":
-        web_note = " Prefer the most recent, credible sources; when dates are available, anchor statements to those dates."
-    elif mode in ("dense", "rerank"):
-        web_note = " Your answer MUST rely on the local sources provided; if they are irrelevant to the ask, say so."
+        web_note = (
+            " Prefer the most recent, credible sources; when dates are available, anchor statements to those dates."
+        )
+    elif mode == "offline":
+        web_note = (
+            " Do not use the web. Prefer local context (personal instruction and conversation files) when available."
+        )
 
     tools_rules = (
-        " Tool-use policy: If the user includes a Python code block, execute it in the sandbox FIRST (unless it uses blocked modules like os/subprocess/socket or file/network I/O—in that case, explain refusal). "
-        "Never request or suggest reading/writing local files, executing shell commands, installing packages, or making network calls. "
+        " Tool-use policy: If the user includes a Python code block and explicitly asks to run it, you may execute it "
+        "in the provided sandbox. Never attempt network access, shell/OS commands, or arbitrary file I/O. "
         "If a tool fails or returns no results, say so briefly and suggest one small next step."
     )
+
     timeout_note = f" Note: {timed_out_note}" if timed_out_note else ""
-    return f"You are a helpful assistant. Always answer in {lang}. {policy}{web_note}{tools_rules}{timeout_note}"
+    personal_section = (
+        f"\nPersonal instructions from the user (honor when compatible with policy):\n{personal_extra}\n"
+        if (personal_extra or "").strip()
+        else ""
+    )
+
+    return f"You are a helpful assistant. Always answer in {lang}. {policy}{web_note}{tools_rules}{timeout_note}{personal_section}"
 
 
 def build_prompt_single(
@@ -691,8 +845,15 @@ def build_prompt_single(
         mode: str,
         timed_out_note: Optional[str] = None,
         history_text: str = "",
+        personal_extra: str = "",
 ) -> str:
-    sys = _base_system_prompt(lang, strict=strict, mode=mode, timed_out_note=timed_out_note)
+    sys = _base_system_prompt(
+        lang,
+        strict=strict,
+        mode=mode,
+        timed_out_note=timed_out_note,
+        personal_extra=personal_extra,
+    )
     convo = f"\n# Conversation so far:\n{history_text}\n" if history_text else ""
     ctx = f"\n# Context:\n{context_text}\n" if context_text else "\n# Context:\n(none)\n"
     return f"{sys}{convo}{ctx}\n# Question:\n{user_query}\n\n# Answer:"
@@ -705,6 +866,7 @@ def build_prompt_mixed(
         *,
         lang: str,
         history_text: str = "",
+        personal_extra: str = "",
 ) -> str:
     sys = (
         f"You are a helpful assistant. Always answer in {lang}. "
@@ -712,6 +874,9 @@ def build_prompt_mixed(
         f"Decide relevance: prefer (B) for breaking news/current facts; prefer (A) when the ask references an uploaded file, example, lines, or internal docs. "
         f"If both are relevant, synthesize. If neither is relevant, say so briefly. Be concise and avoid hallucinations."
     )
+    if (personal_extra or "").strip():
+        sys += f"\nPersonal instructions from the user (honor when compatible with policy):\n{personal_extra}\n"
+
     convo = f"\n# Conversation so far:\n{history_text}\n" if history_text else ""
     return (
         f"{sys}{convo}\n# Context A — Local (may be partial):\n{ctx_rag}\n\n"
@@ -759,16 +924,16 @@ def _sanitize_web_query(text: str) -> str:
 # ---------------------- API ----------------------
 @app.post("/rag/upload")
 async def rag_upload(
-    request: Request,
-    # Accept BOTH "files" (multi) and "file" (single)
-    files: Optional[List[UploadFile]] = File(None, alias="files"),
-    file: Optional[UploadFile] = File(None, alias="file"),
-    # Accept scope and chat_id from query OR from form-data
-    scope_q: Optional[str] = Query(None),
-    scope_f: Optional[str] = Form(None),
-    chat_id_q: Optional[int] = Query(None),
-    chat_id_f: Optional[int] = Form(None),
-    db: AsyncSession = Depends(get_db),
+        request: Request,
+        # Accept BOTH "files" (multi) and "file" (single)
+        files: Optional[List[UploadFile]] = File(None, alias="files"),
+        file: Optional[UploadFile] = File(None, alias="file"),
+        # Accept scope and chat_id from query OR from form-data
+        scope_q: Optional[str] = Query(None),
+        scope_f: Optional[str] = Form(None),
+        chat_id_q: Optional[int] = Query(None),
+        chat_id_f: Optional[int] = Form(None),
+        db: AsyncSession = Depends(get_db),
 ):
     """
     Upload TXT/PDF/DOCX/MD → persist file bytes+metadata AND chunk+embed into Chroma.
@@ -881,77 +1046,102 @@ async def rag_upload(
 
 @app.get("/chat/stream")
 async def chat_stream(
-        q: str = Query(..., description="User query"),
-        mode: str = Query("auto", pattern="^(auto|none|dense|rerank|web)$"),
-        cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
-        chat_id: Optional[int] = Query(None, ge=1),  # persisted chat id (authenticated)
-        scope: str = Query("user", pattern="^(user|chat)$"),  # retrieval namespace scope
-        request: Request = None,  # to identify current user
+    q: str = Query(..., description="User query"),
+    mode: str = Query("auto", pattern="^(auto|offline|web)$"),
+    cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
+    chat_id: Optional[int] = Query(None, ge=1),
+    scope: str = Query("user", pattern="^(user|chat)$"),
+    request: Request = None,
 ):
     """
     Modes:
-      - auto   : Probe local RAG; maybe web if heuristics or weak RAG. Mix contexts smartly.
-      - none   : no retrieval (pure LLM)
-      - dense  : dense retrieval only (STRICT grounding)
-      - rerank : dense + reranker (STRICT grounding)
-      - web    : ALWAYS run web search (with up to 60s budget).
-
-    Namespacing:
-      - scope=user : retrieval filtered to the current user_id (if logged-in)
-      - scope=chat : retrieval filtered to this chat_id (must provide chat_id; falls back to user if missing)
+      - auto    : Decide per prompt; prefer local context; use web unless there is a STRONG local signal.
+      - offline : No web. Use personal instruction and conversation files.
+      - web     : Always perform a network search for each prompt.
     """
+    # --- NEW: time-sensitivity heuristic (EN+HE)
+    _HE_TIME = [
+        r"\bהיום\b", r"\bאתמול\b", r"\bמחר\b", r"\bעדכני(?:ות)?\b", r"\bמעודכן\b", r"\bחדש(?:ה)?\b",
+        r"\bמי\s+ניצח\b", r"\bתוצאות\b", r"\bמחיר\b", r"\bשער\b", r"\bמזג\s+האוויר\b", r"\bתחזית\b",
+        r"\bשוחרר\b", r"\bהושק\b", r"\bהוכרז\b", r"\bמועד\s+אחרון\b", r"\bדדליין\b", r"\bגרסה\b",
+    ]
+    _EN_TIME = [
+        r"\btoday\b", r"\byesterday\b", r"\btomorrow\b", r"\bnow\b", r"\blatest\b", r"\bcurrent\b", r"\brecent\b",
+        r"\bwho\s+won\b", r"\bresults?\b", r"\bscore\b", r"\bprice\b", r"\brate\b", r"\bexchange\b",
+        r"\bweather\b", r"\bforecast\b", r"\breleased?\b", r"\blaunch(?:ed)?\b", r"\bannounc(?:e|ed|ement)\b",
+        r"\bdeadline\b", r"\bdue\s+date\b", r"\brelease\s+date\b", r"\bversion\b", r"\b202[4-9]\b", r"\b20[3-9]\d\b",
+    ]
+    _time_hint_patterns = [re.compile(p, re.IGNORECASE) for p in (_HE_TIME + _EN_TIME)]
+
+    def _is_time_sensitive(text: str) -> bool:
+        return any(p.search(text or "") for p in _time_hint_patterns)
+
+    async def _persist_assistant_message(chat_id_val: int, content: str) -> None:
+        # Persist the assistant's full reply into DB for the given chat (best-effort).
+        if not content.strip():
+            return
+        async with SessionLocal() as dbp:
+            chat_obj = await dbp.get(Chat, chat_id_val)
+            if not chat_obj:
+                return
+            dbp.add(ChatMessage(chat_id=chat_obj.id, role="assistant", content=content))
+            chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
+            await dbp.commit()
 
     async def gen() -> AsyncGenerator[bytes, None]:
         try:
             lang = "Hebrew" if is_hebrew(q) else "English"
             used_tool = False
 
-            # ---- Determine current user and (optional) DB chat + load history ----
+            # ---- Determine current user and optional DB chat + load history ---
             db_user: Optional[User] = None
             db_chat: Optional[Chat] = None
-            db_history_rows: List[Dict[str, str]] = []
+            db_history_rows: List[Dict] = []
+            if request is not None:
+                async with SessionLocal() as db:
+                    db_user = await _current_user(request, db)
+                    if db_user and chat_id:
+                        db_chat = await db.get(Chat, chat_id)
+                        if db_chat and db_chat.user_id != db_user.id:
+                            db_chat = None
+                        if db_chat:
+                            rows = (
+                                await db.execute(
+                                    select(ChatMessage)
+                                    .where(ChatMessage.chat_id == db_chat.id)
+                                    .order_by(ChatMessage.id.asc())
+                                    .limit(200)
+                                )
+                            ).scalars().all()
+                            db_history_rows = [
+                                {"role": m.role, "content": m.content or ""} for m in rows
+                            ]
 
-            async with SessionLocal() as db:
-                db_user = await _current_user(request, db)
-                if db_user and chat_id:
-                    # verify ownership
-                    db_chat = await db.get(Chat, chat_id)
-                    if db_chat and db_chat.user_id != db_user.id:
-                        db_chat = None
-                    if db_chat:
-                        # Load previous turns safely (Row -> mapping)
-                        res = await db.execute(
-                            ChatMessage.__table__
-                            .select()
-                            .where(ChatMessage.__table__.c.chat_id == chat_id)
-                            .order_by(ChatMessage.__table__.c.id.asc())
-                        )
-                        for row in res.mappings():
-                            db_history_rows.append({
-                                "role": row["role"],
-                                "content": row["content"],
-                            })
+            tracer_local = Tracer()
+            trace_id = tracer_local.start_trace(q, mode)
+            if trace_id:
+                yield sse("trace", trace_id)
 
-            # tracing
-            trace_id = tracer.start_trace(q, mode)
-            yield sse("trace", json.dumps({"id": trace_id}))
-
-            citations_combined: List[Dict] = []
-            prompt = ""
-            resp_buf: List[str] = []
-
-            # Build history text BEFORE appending this user turn
+            # ---- Build conversation history text ----
             if db_user and db_chat:
-                history_text = render_history_from_rows(db_history_rows, lang=lang, max_chars=HISTORY_CHAR_BUDGET)
+                history_text = render_history_from_rows(
+                    db_history_rows, lang=lang, max_chars=HISTORY_CHAR_BUDGET
+                )
             else:
                 history_text = memory.render(cid, lang=lang, max_chars=HISTORY_CHAR_BUDGET)
 
-            # Persist/append the current user turn
+            # --- Personal instructions (global toggle from user profile) ---
+            personal_extra = ""
+            if db_user:
+                async with SessionLocal() as db2:
+                    prof = await _get_or_create_profile(db2, int(db_user.id))
+                    if prof.instruction_enabled and (prof.instruction_text or "").strip():
+                        personal_extra = prof.instruction_text.strip()
+
+            # ---- Persist current user turn (DB or in-memory) ----
             if db_user and db_chat:
                 async with SessionLocal() as db:
-                    # attach new user message
                     db.add(ChatMessage(chat_id=db_chat.id, role="user", content=q))
-                    # bump chat timestamp
                     chat_obj = await db.get(Chat, db_chat.id)
                     if chat_obj:
                         chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
@@ -959,57 +1149,50 @@ async def chat_stream(
             else:
                 memory.append(cid, "user", q)
 
-            # ------------------- Python sandbox path -------------------
+            # ------------------- Python sandbox (explicit) -------------------
             py_code = _extract_python_code(q)
             if py_code:
                 used_tool = True
                 res = await run_python(py_code, timeout_sec=5.0)
 
                 tool_payload = {
-                    "name": "py_eval",
-                    "args": {"language": "python", "timeout_s": 5},
+                    "name": "python",
+                    "args": {"timeout_sec": 5.0},
                     "result": res,
                 }
                 yield sse("tool", json.dumps(tool_payload, ensure_ascii=False))
-                tracer.log_tool(trace_id, "py_eval", {"language": "python", "timeout_s": 5}, res)
+                tracer_local.log_tool(trace_id, "python", {"timeout_sec": 5.0}, res)
 
-                ctx_text = (
-                    f"[Code]\n{py_code}\n\n"
-                    f"[Program output]\n{res.get('stdout') or '(no stdout)'}\n\n"
-                    f"[Errors]\n{res.get('stderr') or '(none)'}\n\n"
-                    f"[Meta] ok={res.get('ok')} timeout={res.get('timeout')} duration_ms={res.get('duration_ms')}\n"
-                )
                 prompt = build_prompt_single(
-                    "Please present the program output clearly. If there were errors, explain the most likely cause and suggest a minimal fix.",
-                    ctx_text,
+                    q,
+                    f"Python execution result:\n{res.get('stdout', '')}\nErrors:\n{res.get('stderr', '')}",
                     lang=lang,
                     strict=False,
-                    mode="general",
+                    mode="offline",
                     history_text=history_text,
+                    personal_extra=personal_extra,
                 )
-                async for tok in ollama_stream(prompt):
-                    resp_buf.append(tok)
-                    yield sse("token", tok)
-                    await asyncio.sleep(0)
 
-                assistant_text = "".join(resp_buf)
+                # --- STREAM & PERSIST ASSISTANT (python path)
+                assistant_chunks: List[str] = []
+                had_error = False
+                async for token in ollama_stream(prompt):
+                    if token.startswith("ERROR:"):
+                        had_error = True
+                        yield sse("error", json.dumps({"message": token}))
+                        break
+                    assistant_chunks.append(token)
+                    yield sse("token", token)
 
-                if db_user and db_chat:
-                    async with SessionLocal() as db:
-                        db.add(ChatMessage(chat_id=db_chat.id, role="assistant", content=assistant_text))
-                        chat_obj = await db.get(Chat, db_chat.id)
-                        if chat_obj:
-                            chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
-                        await db.commit()
-                else:
-                    memory.append(cid, "assistant", assistant_text)
+                full_reply = "".join(assistant_chunks).strip()
+                if db_user and db_chat and not had_error:
+                    await _persist_assistant_message(int(db_chat.id), full_reply)
 
-                tracer.end_trace(trace_id, prompt, assistant_text, citations=[], ok=True)
                 yield sse("sources", "[]")
                 yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
                 return
 
-            # ------------------- RAG where-filter (namespacing) --------------------
+            # ------------------- RAG where-filter (namespacing) -------------------
             rag_where: Optional[Dict[str, str]] = None
             if db_user:
                 if scope == "chat" and chat_id:
@@ -1017,98 +1200,81 @@ async def chat_stream(
                 else:
                     rag_where = {"user_id": str(db_user.id)}
 
-            # ------------------- Regular modes ------------------------------------
-            if mode == "none":
+            citations_combined: List[Dict] = []
+            prompt: str
+            timed_out_note: Optional[str] = None
+
+            # ------------------- Mode: OFFLINE -------------------
+            if mode == "offline":
                 ctx_text = ""
                 if (scope == "chat") and db_user and chat_id:
                     async with SessionLocal() as db2:
                         fd = await _fallback_docs_for_chat(db2, int(db_user.id), int(chat_id))
                     if fd:
-                        ctx_text = build_context(q, fd)["context_text"]
+                        b = build_context(q, fd)
+                        ctx_text = b["context_text"]
+                        citations_combined = b["citations"]
+
                 prompt = build_prompt_single(
-                    q, ctx_text, lang=lang, strict=False, mode="general", history_text=history_text
+                    q,
+                    ctx_text,
+                    lang=lang,
+                    strict=False,
+                    mode="offline",
+                    history_text=history_text,
+                    personal_extra=personal_extra,
                 )
 
-            elif mode in ("dense", "rerank"):
-                retriever = Retriever(
-                    k_initial=12,
-                    k_final=int(os.getenv("RAG_TOP_K", "5")),
-                    use_reranker=(mode == "rerank"),
-                )
-                docs = retriever.retrieve(q, where=rag_where)
-
-                # >>> Fallback: if nothing retrieved and we’re in chat scope, inject recent chat files as context.
-                if (not docs) and (scope == "chat") and db_user and chat_id:
-                    async with SessionLocal() as db2:
-                        fd = await _fallback_docs_for_chat(db2, int(db_user.id), int(chat_id))
-                    if fd:
-                        docs = fd
-
-                ctx_rag = build_context(q, docs)
-                prompt = build_prompt_single(
-                    q, ctx_rag["context_text"], lang=lang, strict=True, mode=mode, history_text=history_text
-                )
-                citations_combined = ctx_rag["citations"]
-                used_tool = True
-
-                ev = {
-                    "name": "retrieve_knowledge",
-                    "args": {"query": q, "mode": mode, "where": rag_where},
-                    "result": ctx_rag["citations"],
-                }
-                yield sse("tool", json.dumps(ev, ensure_ascii=False))
-                tracer.log_tool(
-                    trace_id,
-                    "retrieve_knowledge",
-                    {"query": q, "mode": mode, "where": rag_where},
-                    ctx_rag["citations"],
-                )
-
+            # ------------------- Mode: WEB -------------------
             elif mode == "web":
                 ws = WebSearcher()
-                sanitized = _sanitize_web_query(q)
+                sanitized = _sanitize_web_query(q) or (q[:200] if q else "")
                 items: List[Dict] = []
                 provider = "none"
-                debug: List[str] = []
-                timed_out_note = None
+                debug: Dict = {}
                 timed_out = False
-
-                if sanitized:
+                try:
                     items, provider, debug, timed_out = await ws.search(
-                        sanitized, max_results=5, timeout=15.0, time_budget_sec=60.0
+                        sanitized,
+                        max_results=6,
+                        timeout=20.0,
+                        time_budget_sec=60.0,
                     )
-                    if timed_out:
-                        timed_out_note = (
-                            "No web results were found within a 60-second search budget. "
-                            "Inform the user and suggest refining the query."
-                        )
+                except Exception as e:
+                    debug = {"error": str(e)}
+
                 ev = {
                     "name": "web_search",
-                    "args": {"query": sanitized or "(skipped due to code-like text)"},
-                    "result": {"provider": provider, "count": len(items), "debug": debug, "items": items},
+                    "args": {"query": sanitized or "(skipped)"},
+                    "result": {"provider": provider, "count": len(items)},
+                    "debug": debug,
                 }
                 yield sse("tool", json.dumps(ev, ensure_ascii=False))
-                tracer.log_tool(
+                tracer_local.log_tool(
                     trace_id,
                     "web_search",
                     {"query": sanitized or "(skipped)"},
-                    {"provider": provider, "count": len(items), "debug": debug, "items": items},
+                    {"provider": provider, "count": len(items)},
                 )
                 used_tool = True
+                timed_out_note = "Web search timed out; proceeding with partial context." if timed_out else None
 
                 ctx_web = build_web_context(q, items)
                 citations_combined = ctx_web["citations"]
-                if items:
-                    prompt = build_prompt_single(
-                        q, ctx_web["context_text"], lang=lang, strict=False, mode="web", history_text=history_text
-                    )
-                else:
-                    prompt = build_prompt_single(
-                        q, "", lang=lang, strict=False, mode="web", timed_out_note=timed_out_note,
-                        history_text=history_text
-                    )
+                ctx_text = ctx_web["context_text"] if items else ""
+                prompt = build_prompt_single(
+                    q,
+                    ctx_text,
+                    lang=lang,
+                    strict=False,
+                    mode="web",
+                    timed_out_note=timed_out_note,
+                    history_text=history_text,
+                    personal_extra=personal_extra,
+                )
 
-            else:  # auto
+            # ------------------- Mode: AUTO -------------------
+            else:
                 retriever = Retriever(
                     k_initial=12,
                     k_final=int(os.getenv("RAG_TOP_K", "5")),
@@ -1116,7 +1282,7 @@ async def chat_stream(
                 )
                 rag_docs = retriever.retrieve(q, where=rag_where)
 
-                # >>> Fallback: if nothing retrieved and we’re in chat scope, inject recent chat files as context.
+                # Fallback: recent chat files as context if nothing retrieved (chat scope)
                 if (not rag_docs) and (scope == "chat") and db_user and chat_id:
                     async with SessionLocal() as db2:
                         fd = await _fallback_docs_for_chat(db2, int(db_user.id), int(chat_id))
@@ -1124,94 +1290,143 @@ async def chat_stream(
                         rag_docs = fd
 
                 ctx_rag = build_context(q, rag_docs)
-                ev_probe = {
+                yield sse("tool", json.dumps({
                     "name": "retrieve_knowledge_probe",
                     "args": {"query": q, "where": rag_where},
                     "result": ctx_rag["citations"],
-                }
-                yield sse("tool", json.dumps(ev_probe, ensure_ascii=False))
-                tracer.log_tool(
+                }, ensure_ascii=False))
+                tracer_local.log_tool(
                     trace_id, "retrieve_knowledge_probe", {"query": q, "where": rag_where}, ctx_rag["citations"]
                 )
 
-                rag_used = len(rag_docs) > 0
-
-                run_web = _heuristic_wants_web(q)
+                # --- gating between RAG and Web (as in your current version)
                 rag_keywords = _extract_keywords(q)
-                rag_overlap = 0
+                overlap = 0
                 if rag_keywords and rag_docs:
                     text0 = (rag_docs[0].get("text") or "").lower()
-                    rag_overlap = sum(1 for k in rag_keywords if k in text0)
-                rag_strong = (rag_overlap >= 1) or (
-                        rag_docs
-                        and isinstance(rag_docs[0].get("distance", 1.0), (int, float))
-                        and float(rag_docs[0]["distance"]) < 0.55
+                    overlap = sum(1 for k in rag_keywords if k in text0)
+
+                top_dist = None
+                if rag_docs and isinstance(rag_docs[0].get("distance", None), (int, float)):
+                    top_dist = float(rag_docs[0]["distance"])
+
+                doc_hint = _heuristic_wants_rag(q)  # user mentions "document/file/lines/etc."
+                rag_strong = bool(
+                    doc_hint and (
+                        (overlap >= 2) or
+                        (top_dist is not None and top_dist < 0.40)
+                    )
                 )
 
-                ctx_web = {"context_text": "", "citations": []}
-                if run_web or not rag_strong:
-                    # (web search branch unchanged) ...
-                    ...
-                prompt = build_prompt_mixed(
-                    q, ctx_rag["context_text"], ctx_web["context_text"], lang=lang, history_text=history_text
-                )
-                citations_combined = ctx_rag["citations"] + ctx_web["citations"]
-                used_tool = rag_used or (len(ctx_web["citations"]) > 0)
+                wants_web = _is_time_sensitive(q) or _heuristic_wants_web(q) or (not rag_strong)
 
-            # ---- Stream assistant answer ----
-            async for tok in ollama_stream(prompt):
-                resp_buf.append(tok)
-                yield sse("token", tok)
-                await asyncio.sleep(0)
+                if wants_web:
+                    decision = await _classify_with_llm(q)  # best-effort; for trace only
+                    yield sse("tool", json.dumps({
+                        "name": "auto_decision",
+                        "args": {"query": q},
+                        "result": decision,
+                    }, ensure_ascii=False))
+                    tracer_local.log_tool(trace_id, "auto_decision", {"query": q}, decision)
 
-            # Push sources bar
-            yield sse("sources", json.dumps(citations_combined, ensure_ascii=False))
+                    ws = WebSearcher()
+                    sanitized = _sanitize_web_query(q) or (q[:200] if q else "")
+                    items: List[Dict] = []
+                    provider = "none"
+                    debug: Dict = {}
+                    timed_out = False
+                    try:
+                        items, provider, debug, timed_out = await ws.search(
+                            sanitized,
+                            max_results=6,
+                            timeout=20.0,
+                            time_budget_sec=60.0,
+                        )
+                    except Exception as e:
+                        debug = {"error": str(e)}
 
-            assistant_text = "".join(resp_buf)
+                    yield sse("tool", json.dumps({
+                        "name": "web_search",
+                        "args": {"query": sanitized or "(skipped)"},
+                        "result": {"provider": provider, "count": len(items)},
+                        "debug": debug,
+                    }, ensure_ascii=False))
+                    tracer_local.log_tool(
+                        trace_id, "web_search", {"query": sanitized or "(skipped)"},
+                        {"provider": provider, "count": len(items)}
+                    )
+                    used_tool = True
+                    timed_out_note = "Web search timed out; proceeding with partial context." if timed_out else None
 
-            if db_user and db_chat:
-                async with SessionLocal() as db:
-                    db.add(ChatMessage(chat_id=db_chat.id, role="assistant", content=assistant_text))
-                    chat_obj = await db.get(Chat, db_chat.id)
-                    if chat_obj:
-                        chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
-                    await db.commit()
-            else:
-                memory.append(cid, "assistant", assistant_text)
+                    ctx_web = build_web_context(q, items)
+                    citations_combined = (ctx_rag["citations"] or []) + (ctx_web["citations"] or [])
+                    prompt = build_prompt_mixed(
+                        q,
+                        ctx_rag["context_text"],
+                        ctx_web["context_text"],
+                        lang=lang,
+                        history_text=history_text,
+                        personal_extra=personal_extra,
+                    )
+                else:
+                    citations_combined = ctx_rag["citations"]
+                    prompt = build_prompt_single(
+                        q,
+                        ctx_rag["context_text"],
+                        lang=lang,
+                        strict=False,
+                        mode="offline",
+                        history_text=history_text,
+                        personal_extra=personal_extra,
+                    )
 
-            tracer.end_trace(trace_id, prompt, assistant_text, citations_combined, ok=True)
-            yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
-        except Exception as e:
-            yield sse("token", f"ERROR: backend exception: {e}")
-            yield sse("sources", "[]")
+            # ------------------- STREAM & PERSIST ASSISTANT (all non-python paths) -------------------
+            assistant_chunks: List[str] = []
+            had_error = False
+            async for token in ollama_stream(prompt):
+                if token.startswith("ERROR:"):
+                    had_error = True
+                    yield sse("error", json.dumps({"message": token}))
+                    break
+                assistant_chunks.append(token)
+                yield sse("token", token)
+
+            full_reply = "".join(assistant_chunks).strip()
+            if db_user and db_chat and not had_error:
+                await _persist_assistant_message(int(db_chat.id), full_reply)
+
+            # Sources (citations)
             try:
-                assistant_text = "".join(resp_buf) if 'resp_buf' in locals() else ""
-                tracer.end_trace(trace_id, prompt if 'prompt' in locals() else "", assistant_text, [], ok=False)
+                yield sse("sources", json.dumps(citations_combined, ensure_ascii=False))
             except Exception:
-                pass
-            yield sse("done", json.dumps({"ok": False}))
+                yield sse("sources", "[]")
 
-    headers = {
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+            yield sse("done", json.dumps({"ok": True, "used_tool": used_tool}))
+            return
+
+        except Exception as e:
+            # Always end the stream cleanly on unexpected errors
+            yield sse("error", json.dumps({"message": str(e)}))
+            yield sse("done", json.dumps({"ok": False, "used_tool": False}))
+            return
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 
 
 @app.post("/chats/{chat_id}/auto-title")
-async def auto_title(chat_id: int, request: Request, db=Depends(get_db)):
+async def auto_title(chat_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     """
-    Generates a concise title for the given chat based on its FIRST user message,
-    saves it to the DB, and returns { id, title }.
-    Auth: current session cookie (same as other endpoints).
+    Generate a concise title for a chat.
+
+    Behavior:
+      - Prefer the earliest 'user' message from DB.
+      - If missing/empty, try to use client-provided {"first_user_text": "..."}.
+      - If still empty, build a seed from the *attached files' text content* (recent text-like files in this chat).
+      - If everything is empty, fall back to a safe default ("Chat").
     """
-    # Deps/typing (keep local to avoid file-wide import churn)
-    from sqlalchemy.ext.asyncio import AsyncSession
-
-    assert isinstance(db, AsyncSession)
-
-    # Identify current user (same helper used elsewhere in main.py)
+    # Identify current user
     user = await _current_user(request, db)
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1221,32 +1436,62 @@ async def auto_title(chat_id: int, request: Request, db=Depends(get_db)):
     if not chat or chat.user_id != user.id:
         raise HTTPException(status_code=404, detail="Chat not found")
 
-    # First user message (oldest) for this chat
-    q = (
-        ChatMessage.__table__
-        .select()
-        .where(
-            ChatMessage.__table__.c.chat_id == chat_id,
-            ChatMessage.__table__.c.role == "user",
-        )
-        .order_by(ChatMessage.__table__.c.created_at.asc())
+    # 1) Earliest 'user' role message
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.chat_id == chat_id, ChatMessage.role == "user")
+        .order_by(ChatMessage.id.asc())
         .limit(1)
     )
-    res = await db.execute(q)
-    first_row = res.mappings().first()
-    if not first_row:
-        raise HTTPException(status_code=400, detail="No user message found for this chat")
+    row = (await db.execute(stmt)).scalars().first()
+    typed_text = ((row.content or "").strip() if row else "")
 
-    first_user_text = (first_row.get("content") or "").strip()
-    raw = await ollama_generate(_title_prompt(first_user_text))
-    title = (raw or "").strip().strip('"').strip()
-    if not title:
-        title = "Chat"
-    title = title[:80]  # conservative cap
+    # 2) Optional client-provided fallback
+    fallback_text = ""
+    try:
+        payload = await request.json()
+        if isinstance(payload, dict):
+            fallback_text = str(payload.get("first_user_text") or "").strip()
+    except Exception:
+        # tolerate empty/invalid bodies
+        pass
+
+    # Start building a seed
+    seed_text = typed_text or fallback_text
+
+    # 3) If we still don't have anything useful, derive a seed from attached files' content
+    if not seed_text:
+        docs = await _fallback_docs_for_chat(
+            db,
+            user_id=int(user.id),
+            chat_id=int(chat_id),
+            max_files=2,
+            per_file_chars=2000,
+        )
+        parts: List[str] = []
+        for d in docs:
+            src = str(d.get("source") or "file")
+            txt = str(d.get("text") or "")
+            if not txt:
+                continue
+            # keep it short — enough for a good title, cheap for the model
+            snippet = txt[:800]
+            parts.append(f"{src}:\n{snippet}")
+        if parts:
+            seed_text = "\n---\n".join(parts)
+
+    # 4) Final fallback: safe default if we couldn't build a seed
+    if not seed_text:
+        chat.title = "Chat"
+        await db.commit()
+        return {"id": chat.id, "title": chat.title}
+
+    # 5) Ask the model for a short title
+    raw = await ollama_generate(_title_prompt(seed_text))
+    title = (raw or "").strip().strip('"')[:80] or "Chat"
 
     chat.title = title
     await db.commit()
-
     return {"id": chat.id, "title": chat.title}
 
 
@@ -1328,12 +1573,13 @@ async def delete_file(file_id: int, request: Request, db: AsyncSession = Depends
 
     return {"ok": True}
 
+
 @app.post("/files/stage")
 async def stage_files(
-    request: Request,
-    files: Optional[List[UploadFile]] = File(None, alias="files"),
-    draft_id_f: Optional[str] = Form(None, alias="draft_id"),
-    db: AsyncSession = Depends(get_db),
+        request: Request,
+        files: Optional[List[UploadFile]] = File(None, alias="files"),
+        draft_id_f: Optional[str] = Form(None, alias="draft_id"),
+        db: AsyncSession = Depends(get_db),
 ):
     """
     Stage files BEFORE a chat exists. Files are written to disk only, no DB rows.
@@ -1365,9 +1611,9 @@ async def stage_files(
 
 @app.get("/files/stage")
 async def list_staged(
-    request: Request,
-    draft_id: str = Query(..., min_length=6),
-    db: AsyncSession = Depends(get_db),
+        request: Request,
+        draft_id: str = Query(..., min_length=6),
+        db: AsyncSession = Depends(get_db),
 ):
     user = await _current_user(request, db)
     if not user:
@@ -1377,10 +1623,10 @@ async def list_staged(
 
 @app.delete("/files/stage/{sha256_hex}")
 async def delete_staged(
-    sha256_hex: str,
-    request: Request,
-    draft_id: str = Query(..., min_length=6),
-    db: AsyncSession = Depends(get_db),
+        sha256_hex: str,
+        request: Request,
+        draft_id: str = Query(..., min_length=6),
+        db: AsyncSession = Depends(get_db),
 ):
     user = await _current_user(request, db)
     if not user:
@@ -1400,13 +1646,12 @@ async def delete_staged(
     return {"ok": True}
 
 
-
 # --- commit staged files into a specific chat ---
 @app.post("/files/commit")
 async def commit_staged(
-    request: Request,
-    payload: dict = Body(...),
-    db: AsyncSession = Depends(get_db),
+        request: Request,
+        payload: dict = Body(...),
+        db: AsyncSession = Depends(get_db),
 ):
     """
     Commit staged files to a given chat_id:
@@ -1516,3 +1761,185 @@ async def commit_staged(
         pass
 
     return {"ok": True, "count": committed}
+
+
+@app.get("/modes")
+async def get_modes():
+    """
+    Catalog of agent modes (used by the frontend’s Mode Picker).
+    """
+    return [
+        {"id": "offline", "label": "Offline", "desc": "Local files & personal instruction. No web."},
+        {"id": "web", "label": "Network search", "desc": "Always search the web for every prompt."},
+        {"id": "auto", "label": "Automatic", "desc": "Decides between local context and web per prompt."},
+    ]
+
+
+# --- GET profile settings ---
+@app.get("/profile/settings")
+async def get_profile_settings(request: Request, db: AsyncSession = Depends(get_db)):
+    user = await _current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    await _ensure_user_profile_columns(db)
+    prof = await _get_or_create_profile(db, int(user.id))
+
+    return {
+        "instruction_enabled": prof.instruction_enabled,
+        "instruction_text": prof.instruction_text or "",
+        "avatar_kind": prof.avatar_kind or "",
+        "avatar_value": prof.avatar_value or "",
+        "avatar_has_blob": bool(prof.avatar_blob),
+        "display_name": user.display_name or "",
+    }
+
+
+# --- PUT profile settings ---
+@app.put("/profile/settings")
+async def put_profile_settings(payload: ProfileSettingsIO, request: Request, db: AsyncSession = Depends(get_db)):
+    user = await _current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    await _ensure_user_profile_columns(db)
+    prof = await _get_or_create_profile(db, int(user.id))
+
+    prof.instruction_enabled = bool(payload.instruction_enabled)
+    prof.instruction_text = payload.instruction_text or ""
+
+    # Only update avatar_kind/value here (bytes handled by upload endpoint)
+    kind = (payload.avatar_kind or "").strip()
+    if kind not in ("", "system", "upload"):
+        raise HTTPException(status_code=422, detail="Invalid avatar_kind")
+    prof.avatar_kind = kind
+    prof.avatar_value = (payload.avatar_value or "").strip()
+
+    await db.commit()
+    return {"ok": True}
+
+
+# --- POST avatar upload (stores bytes in DB) ---
+@app.post("/profile/avatar/upload")
+async def upload_avatar(
+        file: UploadFile = File(...),
+        request: Request = None,
+        db: AsyncSession = Depends(get_db),
+):
+    user = await _current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    await _ensure_user_profile_columns(db)
+    prof = await _get_or_create_profile(db, int(user.id))
+
+    if file.content_type not in _ALLOWED_IMAGE_MIME:
+        raise HTTPException(status_code=415, detail="Only PNG, JPEG or WEBP are allowed.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Max size is 5MB.")
+
+    prof.avatar_blob = data
+    prof.avatar_mime = file.content_type
+    prof.avatar_kind = "upload"
+    prof.avatar_value = ""
+    prof.avatar_updated_at = dt.datetime.now(dt.timezone.utc)
+
+    await db.commit()
+    return {"ok": True}
+
+
+# --- GET avatar image (upload wins; fallback to system SVG; else 404) ---
+
+def _system_avatar_svg(code: str, label: str) -> bytes:
+    # deterministic colors by code (sys-1..sys-8). Keep it simple, circle + initial.
+    palette = [
+        ("#2563eb", "#60a5fa"),
+        ("#7c3aed", "#a78bfa"),
+        ("#db2777", "#f472b6"),
+        ("#059669", "#34d399"),
+        ("#ea580c", "#fdba74"),
+        ("#0ea5e9", "#67e8f9"),
+        ("#16a34a", "#86efac"),
+        ("#9333ea", "#d8b4fe"),
+    ]
+    idx = 0
+    try:
+        n = int(code.replace("sys-", "").strip()) - 1
+        idx = n % len(palette)
+    except Exception:
+        idx = 0
+    c1, c2 = palette[idx]
+    initial = (label.strip()[:1] or "U").upper()
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="{c1}"/>
+      <stop offset="100%" stop-color="{c2}"/>
+    </linearGradient>
+  </defs>
+  <circle cx="64" cy="64" r="64" fill="url(#g)"/>
+  <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle"
+        font-family="Inter, Arial, sans-serif" font-weight="700" font-size="56"
+        fill="white">{initial}</text>
+</svg>"""
+    return svg.encode("utf-8")
+
+
+@app.get("/profile/avatar")
+async def get_avatar(request: Request, db: AsyncSession = Depends(get_db)):
+    user = await _current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    await _ensure_user_profile_columns(db)
+    prof = await _get_or_create_profile(db, int(user.id))
+
+    # If user uploaded a custom avatar, serve it.
+    if prof.avatar_kind == "upload" and prof.avatar_blob:
+        mime = prof.avatar_mime or "application/octet-stream"
+        headers = {}
+        if prof.avatar_updated_at:
+            headers["Last-Modified"] = prof.avatar_updated_at.isoformat()
+        return Response(content=prof.avatar_blob, media_type=mime, headers=headers)
+
+    # If user selected a system avatar, synthesize SVG for it
+    if prof.avatar_kind == "system" and prof.avatar_value:
+        svg = _system_avatar_svg(prof.avatar_value, user.display_name or "U")
+        return Response(content=svg, media_type="image/svg+xml")
+
+    # No avatar at all
+    raise HTTPException(status_code=404, detail="No avatar configured")
+
+
+@app.put("/profile/account")
+async def update_profile_account(payload: ProfileAccountIn, request: Request, db: AsyncSession = Depends(get_db)):
+    user = await _current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    touched = False
+
+    # Update display_name (optional)
+    if payload.display_name is not None:
+        dn = (payload.display_name or "").strip()
+        user.display_name = dn or None
+        touched = True
+
+    # Change password (optional, requires current_password)
+    if payload.new_password:
+        if not payload.current_password:
+            raise HTTPException(status_code=422, detail="Current password is required to change password.")
+        try:
+            ph.verify(user.password_hash, payload.current_password)
+        except VerifyMismatchError:
+            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+        user.password_hash = ph.hash(payload.new_password)
+        touched = True
+
+    if touched:
+        await db.commit()
+
+    return {"ok": True}

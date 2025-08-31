@@ -1,35 +1,35 @@
 // src/routes/Chat.tsx
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { openChatSSE, type RagMode, type Source, type ToolEvent } from "@/lib/sse";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {openChatSSE, type RagMode, type Source, type ToolEvent} from "@/lib/sse";
 import Header from "@/components/Header";
 import ChatMessage from "@/components/ChatMessage";
 import Composer from "@/components/Composer";
 import SourcesBar from "@/components/SourcesBar";
 import ToolCalls from "@/components/ToolCalls";
 import TracesBar from "@/components/TracesBar";
-import { type Dir, detectDir, looksLikeCode } from "@/lib/text";
-import { ArrowDown } from "lucide-react";
-import { toast } from "sonner";
+import {type Dir, detectDir, looksLikeCode} from "@/lib/text";
+import {ArrowDown} from "lucide-react";
+import {toast} from "sonner";
 import Sidebar from "@/components/Sidebar";
 import ExportPDF from "@/components/ExportPDF";
-import { usePerChatMode } from "@/lib/usePerChatMode";
-import { setChatMode } from "@/lib/modeStorage";
-import { saveLastForChat, loadLastForChat, clearLastForChat } from "@/lib/reasoningStorage";
+// Removed usePerChatMode + setChatMode to avoid resets; we use the new hook:
+import {saveLastForChat, loadLastForChat, clearLastForChat} from "@/lib/reasoningStorage";
 import AttachmentsShelf from "@/components/AttachmentsShelf";
 import DragDropOverlay from "@/components/DragDropOverlay";
+import {useChatMode} from "@/lib/modes";
 
 import {
     createChat,
     deleteChat,
     listChats,
     listMessages,
-    renameChat,
     type ChatSummary,
     autoTitle,
+    renameChat,
 } from "@/lib/chats";
-import { useAuth } from "@/lib/useAuth";
+import {useAuth} from "@/lib/useAuth";
 
-import { stageUpload, listStaged, commitStaged, type StagedItem } from "@/lib/api";
+import {stageUpload, listStaged, commitStaged, type StagedItem} from "@/lib/api";
 
 type Msg = { role: "user" | "assistant"; content: string; dir: Dir };
 type Variant = "guest" | "full";
@@ -41,17 +41,25 @@ function makeCid(): string {
     return Math.random().toString(36).slice(2, 10);
 }
 
-export default function Chat({ variant = "full" }: { variant?: Variant }) {
+// Ensure only valid backend modes ever go out
+function validMode(m: string): RagMode {
+    return (m === "offline" || m === "web" || m === "auto" ? m : "offline") as RagMode;
+}
+
+export default function Chat({variant = "full"}: { variant?: Variant }) {
     const isGuest = variant === "guest";
-    const { me } = useAuth();
+    const {me} = useAuth();
 
     const [messages, setMessages] = useState<Msg[]>([]);
     const [streaming, setStreaming] = useState(false);
 
-    const forcedMode: RagMode | null = isGuest ? "none" : null;
+    // Force a valid default mode for guests (backend expects one of: offline|web|auto)
+    const forcedMode: RagMode | null = isGuest ? "offline" : null;
 
     const [activeChatId, setActiveChatId] = useState<number | null>(null);
-    const [ragMode, setRagMode] = usePerChatMode(activeChatId ? String(activeChatId) : null);
+
+    // New per-chat mode hook (defaults to "offline" and persists; never yields "none")
+    const {mode: ragMode, setMode: setRagMode} = useChatMode(activeChatId ?? undefined);
 
     const [lastSources, setLastSources] = useState<Source[] | null>(null);
     const [lastTools, setLastTools] = useState<ToolEvent[]>([]);
@@ -63,10 +71,32 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     const [loadingChats, setLoadingChats] = useState<boolean>(!isGuest);
 
     // Auto-title trigger for the very first user turn (text OR files)
-    const firstTurnRef = useRef<{ chatId: number | null; shouldAuto: boolean }>({
+    const firstTurnRef = useRef<{ chatId: number | null; shouldAuto: boolean; firstText: string }>({
         chatId: null,
         shouldAuto: false,
+        firstText: "",
     });
+
+    function firstTurnTitleSeed(text: string, staged: StagedItem[]): string {
+        const t = (text ?? "").trim();
+        if (t) return t;
+
+        if (Array.isArray(staged) && staged.length > 0) {
+            // Derive a short, human-friendly seed from up to 3 filenames
+            const pretty = staged
+                .slice(0, 3)
+                .map((s) => String(s?.filename ?? "")
+                    .replace(/\.[^.]+$/, "")         // drop extension
+                    .replace(/[-_]+/g, " ")          // dashes/underscores -> spaces
+                    .replace(/\s+/g, " ")            // collapse spaces
+                    .trim())
+                .filter((name) => name.length > 0);
+
+            if (pretty.length > 0) return pretty.join(", ");
+        }
+        return "";
+    }
+
     const suppressNextLoadRef = useRef<boolean>(false);
 
     const headerRef = useRef<HTMLElement | null>(null);
@@ -94,6 +124,14 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
 
     // Global drag/drop → show overlay over the chat column
     const [dragVisible, setDragVisible] = useState<boolean>(false);
+
+    // Attachments are disabled for guests and in "web" mode
+    const attachmentsEnabled = !isGuest && ragMode !== "web";
+
+    const streamingRef = useRef<boolean>(false);
+    useEffect(() => {
+        streamingRef.current = streaming;
+    }, [streaming]);
 
     // ------- Layout -------
     const layoutViewport = useCallback(() => {
@@ -151,7 +189,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     }, [recomputeBottomState]);
 
     const snapMessageToTop = (msgEl: HTMLElement) => {
-        msgEl.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
+        msgEl.scrollIntoView({block: "start", inline: "nearest", behavior: "auto"});
         const scroller = chatRef.current!;
         const padTop = parseFloat(getComputedStyle(scroller).paddingTop || "0");
         scroller.scrollTop = Math.max(0, msgEl.offsetTop - padTop - 1);
@@ -202,10 +240,16 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         };
     }, [isGuest, me?.id]);
 
-    // --- When active chat changes, hydrate last panels
+    // --- When active chat changes, hydrate last panels & manage SSE lifecycle
     useEffect(() => {
-        if (esRef.current && esChatIdRef.current !== activeChatId) {
-            esRef.current.close();
+        // If there is an open SSE that belongs to a DIFFERENT chat, close it.
+        // Important guard: do not close if we haven't tagged the SSE with a chat yet.
+        if (esRef.current && esChatIdRef.current != null && esChatIdRef.current !== activeChatId) {
+            try {
+                esRef.current.close();
+            } catch {
+                /* ignore */
+            }
             esRef.current = null;
             setStreaming(false);
         }
@@ -224,6 +268,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         setLastTraceId(cached?.traceId ?? null);
         setSourcesByIdx({});
     }, [activeChatId]);
+
 
     // --- Load messages for the selected chat ---
     useEffect(() => {
@@ -249,9 +294,19 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                     content: r.content,
                     dir: detectDir(r.content),
                 }));
-                setMessages(msgs);
+                setMessages((prev) => {
+                    const hasAssistantPlaceholder =
+                        prev.length > 0 &&
+                        prev[prev.length - 1].role === "assistant" &&
+                        prev[prev.length - 1].content === "";
+
+                    if (streamingRef.current || hasAssistantPlaceholder) {
+                        // keep optimistic state; background load is ignored once
+                        return prev;
+                    }
+                    return msgs;
+                });
             } catch (e) {
-                // eslint-disable-next-line no-console
                 console.error(e);
                 toast.error("Failed to load messages");
             }
@@ -279,7 +334,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
 
         setSourcesByIdx((prev) => {
             if (prev[lastAssistantIdx!] && prev[lastAssistantIdx!].length) return prev;
-            return { ...prev, [lastAssistantIdx!]: lastSources };
+            return {...prev, [lastAssistantIdx!]: lastSources};
         });
     }, [messages, lastSources, activeChatId]);
 
@@ -308,7 +363,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         }
     }, [draftId]);
 
-    const onPickFiles = async (files: File[]) => {
+    const onPickFiles = useCallback(async (files: File[]) => {
         if (streaming) return;
         if (!files || files.length === 0) return;
 
@@ -322,7 +377,8 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             setUploadingP(null);
             toast.error(e instanceof Error ? e.message : "Upload failed");
         }
-    };
+    }, [streaming, draftId]);
+
 
     // Keep latest onPickFiles in a ref for drag/drop handlers
     const onPickFilesRef = useRef(onPickFiles);
@@ -333,6 +389,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     // Global drag listeners (overlay appears over chat column)
     useEffect(() => {
         const onDragOver = (e: DragEvent) => {
+            if (isGuest) return; // ⟵ block for guest
             if (!e.dataTransfer) return;
             const hasFiles = Array.from(e.dataTransfer.items || []).some((i) => i.kind === "file");
             if (hasFiles) {
@@ -341,7 +398,6 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             }
         };
         const onDrop = () => {
-            // If drop happens outside our overlay/chat column, just hide
             setDragVisible(false);
         };
         const onKey = (e: KeyboardEvent) => {
@@ -361,16 +417,17 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
             window.removeEventListener("keyup", onKey);
             window.removeEventListener("dragleave", onLeave);
         };
-    }, []);
+    }, [isGuest]);
 
     // ------- Send message -------
+    // REPLACE the whole function in src/routes/Chat.tsx
     const handleSend = async (text: string, kbdDir: Dir) => {
         if (streaming) return;
 
         let ensureChatId: number | undefined = activeChatId ?? undefined;
 
         const hasStaged = staged.length > 0;
-        const textToSend = text.trim(); // no default prompt injection
+        const textToSend = text.trim();
 
         // Create the chat if needed
         if (!isGuest && !ensureChatId) {
@@ -379,61 +436,77 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                 suppressNextLoadRef.current = true;
                 ensureChatId = created.id;
                 setChats((prev) => [created, ...prev]);
+
+                // Persist current mode for the new chat
+                try {
+                    localStorage.setItem(`agent-mode:${created.id}`, (forcedMode ?? ragMode) as RagMode);
+                } catch {
+                    /* ignore */
+                }
+
+                // IMPORTANT: tag the upcoming SSE with this chat id to avoid the close-on-change race
+                esChatIdRef.current = created.id;
+
                 setActiveChatId(created.id);
-                setChatMode(String(created.id), forcedMode ?? ragMode);
-                // Trigger auto-title if first turn has text OR files
-                firstTurnRef.current = { chatId: created.id, shouldAuto: (textToSend.length > 0) || hasStaged };
+
+                // First-turn auto-title trigger
+                firstTurnRef.current = {
+                    chatId: created.id,
+                    shouldAuto: textToSend.length > 0 || hasStaged,
+                    firstText: firstTurnTitleSeed(textToSend, staged),
+                };
             } catch {
                 toast.error("Failed to start a new chat");
                 return;
             }
         } else {
             if (!isGuest && messages.length === 0 && ensureChatId) {
-                firstTurnRef.current = { chatId: ensureChatId, shouldAuto: (textToSend.length > 0) || hasStaged };
+                firstTurnRef.current = {
+                    chatId: ensureChatId,
+                    shouldAuto: textToSend.length > 0 || hasStaged,
+                    firstText: firstTurnTitleSeed(textToSend, staged),
+                };
             } else {
-                firstTurnRef.current = { chatId: null, shouldAuto: false };
+                firstTurnRef.current = { chatId: null, shouldAuto: false, firstText: "" };
             }
         }
 
         // Commit staged files BEFORE streaming
-        if (hasStaged && ensureChatId) {
-            try {
-                const res = await commitStaged(draftId!, ensureChatId);
-                if (res.count > 0) setFilesRefreshKey((v) => v + 1);
+        try {
+            if (draftId && staged.length) {
+                await commitStaged(draftId, ensureChatId);
                 setDraftId(null);
                 setStaged([]);
-            } catch (e: unknown) {
-                toast.error(e instanceof Error ? e.message : "Failed to attach files");
-                return;
+                refreshStaged();
             }
+        } catch {
+            toast.error("Failed to attach files");
+            return;
         }
 
-        // Reset last turn panels
+        // Optimistic messages
+        setMessages((prev) => [
+            ...prev,
+            { role: "user", content: textToSend, dir: kbdDir },
+            { role: "assistant", content: "", dir: kbdDir },
+        ]);
+
+        // Reset side panels
         setLastSources(null);
         setLastTools([]);
         setLastTraceId(null);
         if (ensureChatId) clearLastForChat(ensureChatId);
 
-        const assistantIdx = messages.length + 1;
-        currentAssistantIndexRef.current = assistantIdx;
+        const scopeForStream: "user" | "chat" = ensureChatId ? "chat" : "user";
+        const sendMode: RagMode = validMode(forcedMode ?? ragMode);
 
-        const userMsg: Msg = { role: "user", content: textToSend, dir: kbdDir };
-        const assistantMsg: Msg = { role: "assistant", content: "", dir: kbdDir };
-        setMessages((prev) => [...prev, userMsg, assistantMsg]);
-        setPendingScrollId(`msg-${assistantIdx}`);
+        // --- Open SSE ---
         setStreaming(true);
 
-        setSourcesByIdx((prev) => {
-            const next = { ...prev };
-            delete next[assistantIdx];
-            return next;
-        });
+        // Tag the SSE with its owning chat *for any* chat (new or existing)
+        esChatIdRef.current = ensureChatId ?? null;
 
-        esChatIdRef.current = !isGuest ? (ensureChatId ?? null) : null;
-
-        const scopeForStream: "user" | "chat" = ensureChatId ? "chat" : "user";
-
-        openChatSSE(
+        const es = openChatSSE(
             textToSend,
             {
                 onToken: (t) => {
@@ -448,45 +521,44 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                         return next;
                     });
                 },
-                onSources: (arr) => {
-                    setLastSources(arr);
-                    const idx = currentAssistantIndexRef.current;
-                    if (typeof idx === "number") {
-                        setSourcesByIdx((prev) => ({ ...prev, [idx]: arr }));
-                    }
+                onSources: (srcs) => setLastSources(srcs),
+                onTool: (ev: ToolEvent) => setLastTools((prev) => [...prev, ev]),
+                onTrace: (traceId) => setLastTraceId(traceId || null),
+                onError: (msg) => {
+                    setStreaming(false);
+                    toast.error(`שגיאת סטרימינג: ${msg}`);
                 },
-                onTool: (ev) => setLastTools((prev) => [...prev, ev]),
-                onTrace: (id) => setLastTraceId(id),
                 onDone: () => {
                     setStreaming(false);
+
+                    // First-turn auto-title (if required)
                     const ft = firstTurnRef.current;
-                    if (!isGuest && ft.chatId && ft.shouldAuto) {
+                    if (ft.shouldAuto && ft.chatId) {
                         (async () => {
                             try {
-                                const res = await autoTitle(ft.chatId!);
+                                const res = await autoTitle(ft.chatId!, ft.firstText);
                                 setChats((prev) => prev.map((c) => (c.id === res.id ? { ...c, title: res.title } : c)));
                             } catch (e) {
                                 // eslint-disable-next-line no-console
                                 console.warn("auto-title failed:", e);
                             } finally {
-                                firstTurnRef.current = { chatId: null, shouldAuto: false };
+                                firstTurnRef.current = { chatId: null, shouldAuto: false, firstText: "" };
                             }
                         })();
                     }
                 },
-                onError: (msg) => {
-                    setStreaming(false);
-                    toast.error(`שגיאת סטרימינג: ${msg}`);
-                },
             },
             {
-                mode: forcedMode ?? ragMode,
+                mode: sendMode,
                 cid: isGuest ? cid : undefined,
                 chatId: !isGuest ? ensureChatId : undefined,
                 scope: scopeForStream,
             }
         );
+
+        esRef.current = es;
     };
+
 
     useEffect(() => {
         return () => {
@@ -498,12 +570,12 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
     const jumpToBottom = () => {
         const el = chatRef.current;
         if (!el) return;
-        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        el.scrollTo({top: el.scrollHeight, behavior: "smooth"});
     };
 
     const clearBackendCid = async (id: string) => {
         try {
-            await fetch(`http://localhost:8000/chat/clear?cid=${encodeURIComponent(id)}`, { method: "POST" });
+            await fetch(`http://localhost:8000/chat/clear?cid=${encodeURIComponent(id)}`, {method: "POST"});
         } catch {
             /* ignore */
         }
@@ -521,6 +593,7 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
         setSourcesByIdx({});
         setDraftId(null);
         setStaged([]);
+        // Mode is not reset to "none" — useChatMode will keep/persist per-chat and default to "offline" for new.
     }, [isGuest]);
 
     useEffect(() => {
@@ -615,31 +688,39 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                             {!isGuest && loadingChats && <div className="opacity-70 py-4">טוען היסטוריית שיחות…</div>}
 
                             {/* Left attachments shelf */}
-                            <AttachmentsShelf
-                                chatId={activeChatId}
-                                draftId={draftId}
-                                staged={staged}
-                                onRefreshStaged={refreshStaged}
-                                refreshKey={filesRefreshKey}
-                            />
+                            {attachmentsEnabled && (
+                                <div className="w-full pb-6">
+                                    <div>
+                                        <AttachmentsShelf
+                                            chatId={activeChatId}
+                                            draftId={draftId}
+                                            staged={staged}
+                                            onRefreshStaged={refreshStaged}
+                                            refreshKey={filesRefreshKey}
+                                        />
+                                    </div>
+                                </div>
+                            )}
 
                             {/* Blank state */}
                             {!isGuest && !activeChatId && messages.length === 0 && (
                                 <div className="w-full h-full grid place-items-center">
-                                    <div className="text-center opacity-80">
-                                        <div className="text-xl font-bold mb-2">שיחה חדשה</div>
-                                        <div className="text-sm mb-4">כתוב את ההודעה הראשונה כדי להתחיל</div>
+                                    <div className="text-center">
+                                        <div className="text-xl font-bold mb-2 ui-title-strong">שיחה חדשה</div>
+                                        <div className="text-sm opacity-80 ui-title-normal">כתוב את ההודעה הראשונה כדי
+                                            להתחיל
+                                        </div>
                                     </div>
                                 </div>
                             )}
 
                             {messages.map((m, idx) => (
-                                <ChatMessage key={idx} id={`msg-${idx}`} role={m.role} content={m.content} />
+                                <ChatMessage key={idx} id={`msg-${idx}`} role={m.role} content={m.content}/>
                             ))}
 
-                            <TracesBar traceId={lastTraceId} />
-                            {lastTools.length > 0 && <ToolCalls items={lastTools} />}
-                            {lastSources && lastSources.length > 0 && <SourcesBar items={lastSources} />}
+                            <TracesBar traceId={lastTraceId}/>
+                            {lastTools.length > 0 && <ToolCalls items={lastTools}/>}
+                            {lastSources && lastSources.length > 0 && <SourcesBar items={lastSources}/>}
                         </div>
 
                         {/* Drag & Drop overlay sits above the chat column only */}
@@ -658,14 +739,14 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                     className="jump-down"
                     onClick={jumpToBottom}
                     aria-label="לקפוץ לתגובה העדכנית"
-                    style={{ bottom: jumpBtnBottom }}
+                    style={{bottom: jumpBtnBottom}}
                     title="לתחתית"
                 >
-                    <ArrowDown className="size-5" />
+                    <ArrowDown className="size-5"/>
                 </button>
             )}
 
-            {/* Fixed composer with Upload + Export inside it */}
+            {/* Composer — hide paperclip + Export for guest */}
             <Composer
                 disabled={streaming}
                 onSend={handleSend}
@@ -673,12 +754,15 @@ export default function Chat({ variant = "full" }: { variant?: Variant }) {
                 canSendEmpty={canSendEmpty}
                 onPickFiles={onPickFiles}
                 uploadingProgress={uploadingP}
+                showAttach={attachmentsEnabled}
                 rightActions={
-                    <ExportPDF
-                        chatTitle={activeTitle}
-                        messages={messages.map((m) => ({ role: m.role, content: m.content }))}
-                        sourcesByIndex={sourcesByIdx}
-                    />
+                    !isGuest ? (
+                        <ExportPDF
+                            chatTitle={activeTitle}
+                            messages={messages.map((m) => ({role: m.role, content: m.content}))}
+                            sourcesByIndex={sourcesByIdx}
+                        />
+                    ) : null
                 }
             />
         </div>

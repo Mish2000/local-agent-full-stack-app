@@ -9,6 +9,7 @@ import { api } from "@/lib/api";
 import { Sparkles } from "lucide-react";
 import PasswordMeter from "@/components/PasswordMeter";
 import { validateEmail, assessPassword } from "@/lib/validators";
+import {APP_NAME} from "@/config/app.ts";
 
 type Me = { id: number; email: string; display_name?: string | null };
 
@@ -52,15 +53,15 @@ export default function Register() {
 
     return (
         <div className="min-h-dvh bg-[var(--bg)] text-[var(--text)] grid grid-rows-[auto_1fr]">
-            <header className="sticky top-0 z-40">
-                <div className="container py-3 flex items-center justify-between">
+            <header className="header sticky top-0 z-40">
+                <div className="container py-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
-                        <Sparkles className="size-5" />
-                        <h1 className="text-[20px] font-bold">Agent 2.0 — הרשמה</h1>
+                        <Sparkles className="size-5 opacity-80" />
+                        <h1 className="text-[20px] font-bold leading-tight">{APP_NAME} — הרשמה</h1>
                     </div>
                     <nav className="flex items-center gap-3">
-                        <Link to="/" className="hover:underline">בית</Link>
-                        <Link to="/login" className="hover:underline">התחברות</Link>
+                        <Link to="/" className="text-[15px] font-semibold hover:underline">בית</Link>
+                        <Link to="/login" className="text-[15px] font-semibold hover:underline">התחברות</Link>
                     </nav>
                 </div>
             </header>

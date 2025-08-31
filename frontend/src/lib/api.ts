@@ -11,7 +11,6 @@ export async function api<T, B = unknown>(
     path: string,
     opts: ApiOptions<B> = {} as ApiOptions<B>
 ): Promise<T> {
-    // Detect FormData to avoid forcing JSON headers/encoding.
     const isFormData =
         typeof FormData !== "undefined" && opts.body instanceof FormData;
 
@@ -75,7 +74,7 @@ export async function uploadDocs(
 
     return api<UploadDocsResponse>(`/rag/upload?${qs.toString()}`, {
         method: "POST",
-        body: fd as unknown as FormData, // handled above by api()
+        body: fd as unknown as FormData,
     });
 }
 
@@ -126,8 +125,7 @@ export async function unstage(
 }
 
 /**
- * Stage files to the backend with upload progress. Returns draft_id and list.
- * Note: we use XHR because fetch() has no upload progress events.
+ * Stage files with progress using XHR (fetch lacks upload progress).
  */
 export function stageUpload(
     files: File[],
@@ -186,4 +184,80 @@ export async function commitStaged(
             body: { draft_id: draftId, chat_id: chatId },
         }
     );
+}
+
+export type AgentMode = "offline" | "web" | "auto";
+
+export interface ModesItem {
+    id: AgentMode;
+    label: string;
+    desc: string;
+}
+
+export type ProfileSettings = {
+    instruction_enabled: boolean;
+    instruction_text: string;
+    avatar_kind?: "" | "system" | "upload";
+    avatar_value?: string;
+    display_name?: string;
+};
+
+export type AccountUpdate = {
+    display_name?: string;
+    current_password?: string;
+    new_password?: string;
+};
+
+export async function apiUpdateAccount(p: AccountUpdate): Promise<{ ok: boolean }> {
+    const r = await fetch(`${BASE}/profile/account`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(p),
+    });
+    if (!r.ok) throw new Error(`PUT /profile/account ${r.status}`);
+    return r.json();
+}
+
+const BASE = import.meta.env.VITE_BACKEND_ORIGIN ?? "http://localhost:8000";
+
+export async function apiGetModes(): Promise<ModesItem[]> {
+    const r = await fetch(`${BASE}/modes`, { credentials: "include" });
+    if (!r.ok) throw new Error(`GET /modes ${r.status}`);
+    return r.json();
+}
+
+export async function apiGetProfileSettings(): Promise<ProfileSettings> {
+    const r = await fetch(`${BASE}/profile/settings`, { credentials: "include" });
+    if (!r.ok) throw new Error(`GET /profile/settings ${r.status}`);
+    return r.json();
+}
+
+/** Backend returns { ok: true } for PUT. */
+export async function apiPutProfileSettings(
+    p: ProfileSettings
+): Promise<{ ok: boolean }> {
+    const r = await fetch(`${BASE}/profile/settings`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(p),
+    });
+    if (!r.ok) throw new Error(`PUT /profile/settings ${r.status}`);
+    return r.json();
+}
+
+export async function apiUploadAvatar(file: File): Promise<{ ok: boolean }> {
+    const fd = new FormData();
+    fd.append("file", file);
+    return api<{ ok: boolean }>("/profile/avatar/upload", {
+        method: "POST",
+        body: fd,
+    });
+}
+
+/** Helper for consistent avatar URL + cache-busting when needed. */
+export function avatarUrl(cacheBust = true): string {
+    const u = `${BASE}/profile/avatar`;
+    return cacheBust ? `${u}?t=${Date.now()}` : u;
 }

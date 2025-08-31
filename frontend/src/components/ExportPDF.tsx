@@ -3,6 +3,7 @@ import * as React from "react";
 import type { Source } from "@/lib/sse";
 import { splitFences } from "@/lib/markdownUtils";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
 
 // Shape of messages we export
 type Msg = { role: "user" | "assistant"; content: string };
@@ -211,10 +212,10 @@ export default function ExportPDF({ chatTitle, messages, sourcesByIndex = {} }: 
     };
 
     return (
-        <button
+        <Button
             type="button"
             onClick={exportNow}
-            className="inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-sm bg-[var(--panel)]"
+            className="h-10 rounded-2xl inline-flex items-center gap-2"
             aria-label="Export to PDF"
             title="Export conversation to PDF"
         >
@@ -222,6 +223,6 @@ export default function ExportPDF({ chatTitle, messages, sourcesByIndex = {} }: 
                 <path d="M19 14v7H5v-7H3v9h18v-9h-2zM12 16l4-4h-3V3h-2v9H8l4 4z"></path>
             </svg>
             <span>Export PDF</span>
-        </button>
+        </Button>
     );
 }

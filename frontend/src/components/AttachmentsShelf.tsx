@@ -1,8 +1,8 @@
 // src/components/AttachmentsShelf.tsx
 import * as React from "react";
-import { listFiles, type FileItem, unstage, type StagedItem } from "@/lib/api";
-import { Trash2, Paperclip, Clock } from "lucide-react";
-import { toast } from "sonner";
+import {listFiles, type FileItem, unstage, type StagedItem} from "@/lib/api";
+import {Trash2, Paperclip, Clock} from "lucide-react";
+import {toast} from "sonner";
 
 type Props = {
     chatId: number | null;
@@ -66,17 +66,19 @@ export default function AttachmentsShelf({
                 width: 280,
             }}
         >
-            <div className="rounded-2xl border border-[var(--border)] bg-[var(--panel)] shadow-[var(--shadow)] overflow-hidden">
-                <div className="px-3 py-2 border-b border-[var(--border)] text-sm font-semibold flex items-center gap-2">
-                    <Paperclip className="size-4 opacity-80" />
-                    Attachments
+            <div className="rounded-2xl border bg-[var(--panel)] shadow-sm overflow-hidden"
+                 style={{minWidth: 280, width: "max-content", display: "inline-block"}}>
+                <div
+                    className="px-3 py-2 border-b border-[var(--border)] text-sm font-semibold flex items-center gap-2">
+                    <Paperclip className="size-4 opacity-80"/>
+                    העלאות
                 </div>
 
                 {/* Pending (staged) files — shown for both new & existing chats */}
                 {showPending && (
                     <div className="px-3 py-2 border-b border-[var(--border)]">
                         <div className="text-xs uppercase tracking-wide opacity-70 mb-2 flex items-center gap-1">
-                            <Clock className="size-3.5" />
+                            <Clock className="size-3.5"/>
                             Pending (will attach on Send)
                         </div>
                         <ul className="grid gap-1.5">
@@ -85,7 +87,7 @@ export default function AttachmentsShelf({
                                     key={s.sha256_hex}
                                     className="flex items-center justify-between gap-2 rounded-lg px-2 py-1 text-sm border border-[var(--border)] bg-[var(--bg)]"
                                 >
-                                    <div className="truncate" title={s.filename}>
+                                    <div className="whitespace-nowrap text-sm leading-tight" title={s.filename}>
                                         {s.filename}
                                         <span className="opacity-60 text-xs"> · {s.size_bytes} bytes</span>
                                     </div>
@@ -95,7 +97,7 @@ export default function AttachmentsShelf({
                                         aria-label={`Remove ${s.filename}`}
                                         title="Remove"
                                     >
-                                        <Trash2 className="size-3.5" />
+                                        <Trash2 className="size-3.5"/>
                                         Remove
                                     </button>
                                 </li>
@@ -107,10 +109,10 @@ export default function AttachmentsShelf({
                 {/* Saved files for this chat */}
                 <div className="px-3 py-2">
                     <div className="text-xs uppercase tracking-wide opacity-70 mb-2">
-                        {chatId ? "Saved in this chat" : "No chat selected"}
+                        {chatId ? "קבצים שמורים יופיעו כאן" : "לא התחילה שיחה"}
                     </div>
                     {!chatId ? (
-                        <div className="text-xs opacity-60">Start a chat or pick files to stage.</div>
+                        <div className="text-xs opacity-60">התחל שיחה או העלה קובץ</div>
                     ) : showSaved ? (
                         <ul className="grid gap-1.5">
                             {saved.map((f) => (
@@ -118,7 +120,7 @@ export default function AttachmentsShelf({
                                     key={f.id}
                                     className="flex items-center justify-between gap-2 rounded-lg px-2 py-1 text-sm border border-[var(--border)] bg-[var(--bg)]"
                                 >
-                                    <div className="truncate" title={f.filename}>
+                                    <div className="whitespace-nowrap text-sm leading-tight" title={f.filename}>
                                         {f.filename}
                                         {typeof f.size_bytes === "number" && (
                                             <span className="opacity-60 text-xs"> · {f.size_bytes} bytes</span>
@@ -128,7 +130,7 @@ export default function AttachmentsShelf({
                             ))}
                         </ul>
                     ) : (
-                        <div className="text-xs opacity-60">No files saved yet.</div>
+                        <div className="text-xs opacity-60">כרגע אין קבצים שמורים</div>
                     )}
                 </div>
             </div>

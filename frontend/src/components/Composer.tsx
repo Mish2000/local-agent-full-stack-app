@@ -1,22 +1,19 @@
 // src/components/Composer.tsx
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { type Dir, detectDir } from "@/lib/text";
-import { Textarea } from "@/components/ui/textarea";
-import { Button } from "@/components/ui/button";
-import { Paperclip } from "lucide-react";
+import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {type Dir, detectDir} from "@/lib/text";
+import {Textarea} from "@/components/ui/textarea";
+import {Button} from "@/components/ui/button";
+import {Paperclip} from "lucide-react";
 
 type Props = {
     disabled: boolean;
     onSend: (text: string, dir: Dir) => void;
     onHeightChange?: (h: number) => void;
-
-    // Staged-uploads flow:
-    canSendEmpty: boolean;                // true when staged attachments exist
-    onPickFiles: (files: File[]) => void; // upload or stage files
-    uploadingProgress?: number | null;    // 0..1 while staging
-
-    // Your Export PDF button (React node). We'll render it next to the paperclip.
+    canSendEmpty: boolean;
+    onPickFiles: (files: File[]) => void;
+    uploadingProgress?: number | null;
     rightActions?: React.ReactNode;
+    showAttach?: boolean;
 };
 
 export default function Composer({
@@ -27,6 +24,7 @@ export default function Composer({
                                      onPickFiles,
                                      uploadingProgress = null,
                                      rightActions,
+                                     showAttach = true,
                                  }: Props) {
     const [text, setText] = useState("");
     const [lastDir, setLastDir] = useState<Dir>("rtl");
@@ -125,22 +123,27 @@ export default function Composer({
             >
                 {/* Input row: Paperclip + Export (rightActions) + Textarea */}
                 <div className="flex items-end gap-2">
-                    <button
-                        type="button"
-                        className="inline-flex items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--bg)] h-10 w-10"
-                        title={lastDir === "rtl" ? "צרף קבצים" : "Attach files"}
-                        aria-label="Attach files"
-                        onClick={() => fileRef.current?.click()}
-                    >
-                        <Paperclip className="size-4" />
-                    </button>
-                    <input
-                        ref={fileRef}
-                        type="file"
-                        multiple
-                        className="hidden"
-                        onChange={(e) => onFilesSelected(e.currentTarget.files)}
-                    />
+                    {showAttach && (
+                        <>
+                            <button
+                                type="button"
+                                className="inline-flex items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--bg)] h-10 w-10"
+                                title={lastDir === "rtl" ? "צרף קבצים" : "Attach files"}
+                                aria-label="Attach files"
+                                onClick={() => fileRef.current?.click()}
+                                disabled={disabled}
+                            >
+                                <Paperclip className="size-4" />
+                            </button>
+                            <input
+                                ref={fileRef}
+                                type="file"
+                                multiple
+                                className="hidden"
+                                onChange={(e) => onFilesSelected(e.currentTarget.files)}
+                            />
+                        </>
+                    )}
 
                     {/* Export PDF sits immediately to the RIGHT of the paperclip */}
                     {rightActions}
@@ -187,7 +190,7 @@ export default function Composer({
                         title={lastDir === "rtl" ? "שלח" : "Send"}
                         aria-label={lastDir === "rtl" ? "שלח" : "Send"}
                     >
-                        {lastDir === "rtl" ? (disabled ? "מייצר…" : "שלח") : disabled ? "Thinking…" : "Send"}
+                        {lastDir === "rtl" ? (disabled ? "מייצר…" : "שלח") : disabled ? "Generating…" : "Send"}
                     </Button>
                 </div>
             </div>

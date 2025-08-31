@@ -38,7 +38,7 @@ export default function ToolCalls({ items }: { items: ToolEvent[] }) {
     return (
         <div className="msg w-full max-w-[80ch] self-center mx-auto px-2 sm:px-0">
             <div className="flex items-center justify-between mb-2">
-                <div className="text-[13px] opacity-85">Reasoning steps</div>
+                <div className="text-[13px] opacity-85">צעדי חשיבה</div>
                 <button
                     type="button"
                     className="text-[12px] opacity-75 hover:opacity-100 underline"
@@ -51,7 +51,7 @@ export default function ToolCalls({ items }: { items: ToolEvent[] }) {
                         }
                     }}
                 >
-                    Hide
+                    הסתר
                 </button>
             </div>
 
@@ -72,7 +72,7 @@ export default function ToolCalls({ items }: { items: ToolEvent[] }) {
                                 <pre className="whitespace-pre-wrap text-xs leading-relaxed">{argsText}</pre>
                                 {ev.result !== undefined && (
                                     <div className="mt-2">
-                                        <div className="text-xs opacity-70 mb-1">result</div>
+                                        <div className="text-xs opacity-70 mb-1">תוצאה</div>
                                         <pre className="whitespace-pre-wrap text-xs leading-relaxed">{resultText}</pre>
                                     </div>
                                 )}

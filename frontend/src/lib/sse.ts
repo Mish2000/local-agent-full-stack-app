@@ -1,81 +1,64 @@
 // src/lib/sse.ts
+export type RagMode = "offline" | "web" | "auto";
+
 export type Source = {
     id: number;
     source: string;
-    preview: string;
-    score: number;
+    preview?: string;
     start_line?: number;
     end_line?: number;
+    score?: number;
     url?: string;
 };
 
 export type ToolEvent = {
-    tool: string;
     name: string;
-    args?: Record<string, unknown>;
+    args?: unknown;
     result?: unknown;
-    error?: string;
+    debug?: unknown;
 };
 
-export type SSEHandlers = {
+type Handlers = {
     onToken: (t: string) => void;
+    onSources: (s: Source[]) => void;
+    onTool: (e: ToolEvent) => void;
+    onTrace: (id: string) => void;
     onDone: () => void;
     onError: (msg: string) => void;
-    onSources?: (arr: Source[]) => void;
-    onTool?: (ev: ToolEvent) => void;
-    onTrace?: (traceId: string) => void;
 };
-
-export type RagMode = "auto" | "none" | "dense" | "rerank" | "web";
 
 type OpenOpts = {
-    mode?: RagMode;
-    cid?: string;                // guest/ephemeral id
-    chatId?: number;             // persisted chat id
-    scope?: "user" | "chat";     // retrieval namespacing (defaults in backend: user)
+    mode: RagMode;
+    cid?: string;
+    chatId?: number;
+    scope: "user" | "chat";
 };
 
-export function openChatSSE(
-    prompt: string,
-    handlers: SSEHandlers,
-    opts: OpenOpts = {}
-): EventSource {
-    const base = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
-    const mode: RagMode = opts.mode ?? "auto";
-    const params = new URLSearchParams({
-        q: prompt,
-        mode,
-    });
+const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://localhost:8000";
 
-    if (opts.cid) params.set("cid", opts.cid);
-    if (typeof opts.chatId === "number") params.set("chat_id", String(opts.chatId));
-    if (opts.scope) params.set("scope", opts.scope);
+export function openChatSSE(q: string, h: Handlers, opts: OpenOpts) {
+    const url = new URL(`${API_BASE}/chat/stream`);
+    url.searchParams.set("q", q);
+    url.searchParams.set("mode", opts.mode);
+    url.searchParams.set("scope", opts.scope);
+    if (opts.chatId) url.searchParams.set("chat_id", String(opts.chatId));
+    if (opts.cid) url.searchParams.set("cid", opts.cid);
 
-    const url = `${base}/chat/stream?${params.toString()}`;
+    const es = new EventSource(url.toString(), { withCredentials: true });
 
-    // IMPORTANT: include cookies with SSE across origins
-    const es = new EventSource(url, { withCredentials: true });
-
-    es.addEventListener("token", (e: MessageEvent) => handlers.onToken(e.data));
-    es.addEventListener("trace", (e: MessageEvent) => {
-        try {
-            const obj = JSON.parse(e.data);
-            if (obj?.id) handlers.onTrace?.(obj.id);
-        } catch { /* ignore */ }
-    });
+    es.addEventListener("token", (e: MessageEvent) => h.onToken((e as MessageEvent).data ?? ""));
     es.addEventListener("sources", (e: MessageEvent) => {
-        try { handlers.onSources?.(JSON.parse(e.data)); } catch { /* ignore */ }
+        try { h.onSources(JSON.parse((e as MessageEvent).data ?? "[]")); } catch { h.onSources([]); }
     });
     es.addEventListener("tool", (e: MessageEvent) => {
-        try { handlers.onTool?.(JSON.parse(e.data)); } catch { /* ignore */ }
+        try { h.onTool(JSON.parse((e as MessageEvent).data ?? "{}")); } catch { /* ignore */ }
     });
+    es.addEventListener("trace", (e: MessageEvent) => h.onTrace((e as MessageEvent).data ?? ""));
+    es.addEventListener("error", (e: MessageEvent) => h.onError((e as MessageEvent).data ?? "stream error"));
     es.addEventListener("done", () => {
-        handlers.onDone();
         es.close();
+        h.onDone();
     });
-    es.onerror = () => {
-        handlers.onError("SSE connection error");
-        es.close();
-    };
+
     return es;
 }

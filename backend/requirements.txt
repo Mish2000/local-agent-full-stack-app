@@ -1,0 +1,32 @@
+# ===== FastAPI app =====
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart
+httpx
+
+# ===== Database & ORM =====
+SQLAlchemy
+aiomysql          # MySQL async driver
+aiosqlite         # SQLite async driver (safe to keep for local dev)
+
+# ===== Auth & Validation =====
+email-validator
+argon2-cffi
+cryptography      # required by MySQL 8's caching_sha2_password with PyMySQL/aiomysql
+
+# ===== RAG / LLM stack =====
+torch
+sentence-transformers
+chromadb
+langchain-core
+langchain-ollama
+ollama
+
+# ===== Evaluation & Datasets =====
+ragas
+datasets
+pandas
+
+# ===== Document ingestion =====
+docx2txt

@@ -12,6 +12,9 @@
     --shadow: 0 6px 24px rgba(0,0,0,.08), 0 2px 6px rgba(0,0,0,.06);
     --scroll-track: #f0f2f5;
     --scroll-thumb: #cbd5e1;
+    --header-bg: #ffffff;
+    --header-fg: var(--text-strong);
+    --header-border: var(--border);
     color-scheme: light;
 }
 
@@ -27,6 +30,8 @@
         --shadow: 0 6px 24px rgba(0,0,0,.4), 0 2px 6px rgba(0,0,0,.3);
         --scroll-track: #0e1424;
         --scroll-thumb: #374151;
+        --header-bg: #0f172a;
+        --header-fg: #ffffff;
         color-scheme: dark;
     }
 }
@@ -50,9 +55,14 @@ html, body, #root {
 
 /* Header */
 .header {
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
+    background: var(--header-bg);
+    color: var(--header-fg);
+    border-bottom: 1px solid var(--header-border);
+    /* keep the subtle glass look only when supported */
+    backdrop-filter: saturate(140%) blur(8px);
 }
+.header a { color: inherit; }
+
 
 /* Fixed chat viewport between header & composer */
 .chat-viewport {
@@ -318,3 +328,76 @@ pre { padding: 10px 12px; border-radius: 10px; overflow-x: auto; border: 1px sol
     cursor: pointer;
 }
 .msg-toolbar-btn:hover { filter: brightness(0.98); }
+
+/* === Title utilities (consistent in light & dark) === */
+.ui-title-strong {
+    color: var(--text-strong);
+}
+.ui-title-normal {
+    color: var(--text);
+}
+
+/* === Sidebar: keep scrollbar on the RIGHT in RTL, match chat's styling ===
+   We make the scrolling container LTR (so the scrollbar renders on the right)
+   and switch content back to RTL for correct Hebrew layout.
+*/
+.sidebar {
+    direction: ltr;           /* puts scrollbar on the RIGHT in RTL locales */
+    overflow-y: auto;         /* ensure the sidebar itself scrolls vertically */
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track); /* same palette as .chat */
+    /* NOTE: We intentionally do NOT set scrollbar width, per your request */
+}
+
+/* Make all sidebar descendants RTL again so the Hebrew content is natural. */
+.sidebar * {
+    direction: rtl;
+    unicode-bidi: plaintext;  /* robust bidi behavior for mixed content */
+}
+
+/* WebKit scrollbar visuals (match .chat, but keep width as the browser default) */
+.sidebar::-webkit-scrollbar-track { background: var(--scroll-track); border-radius: 8px; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 8px; }
+.sidebar::-webkit-scrollbar-thumb:hover { filter: brightness(0.95); }
+
+/* (Optional) subtle hover on the whole sidebar area to match panel behavior */
+.sidebar:hover::-webkit-scrollbar-thumb { filter: brightness(0.95); }
+
+/* === Global button hover micro-interactions (subtle & universal) === */
+@layer base {
+    :where(button, .button, [role="button"], .pressable) {
+        transition:
+                transform .15s ease,
+                box-shadow .20s ease,
+                background-color .20s ease,
+                opacity .20s ease;
+        will-change: transform;
+    }
+
+    :where(button, .button, [role="button"], .pressable):hover:not(:disabled) {
+        transform: translateY(-1px);
+        box-shadow: var(--shadow);
+    }
+
+    :where(button, .button, [role="button"], .pressable):active:not(:disabled) {
+        transform: translateY(0);
+        box-shadow: none;
+    }
+
+    /* For tiny text action buttons (e.g., rename/delete in conversations list) */
+    .pressable-text {
+        transition: transform .15s ease, opacity .20s ease;
+        will-change: transform;
+    }
+    .pressable-text:hover { transform: translateY(-1px); opacity: 1; }
+    .pressable-text:active { transform: translateY(0); }
+
+    /* Optional: honor reduced motion */
+    @media (prefers-reduced-motion: reduce) {
+        :where(button, .button, [role="button"], .pressable),
+        .pressable-text {
+            transition: none;
+        }
+    }
+}
+
+
