@@ -7,6 +7,7 @@ import os
 import random
 import string
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
 import chromadb
@@ -27,6 +28,12 @@ from sentence_transformers import SentenceTransformer
 
 # Project retriever
 from rag.retriever import Retriever
+from rag.common import (
+    CHROMA_DIR,
+    COLLECTION,
+    get_collection,
+    get_embedder,
+)
 
 # Docs for this API style: evaluate + EvaluationDataset + class metrics + wrappers.  # noqa
 # (See: Ragas Evaluate docs and “Evaluate Using Metrics” tutorial)
@@ -35,25 +42,29 @@ from rag.retriever import Retriever
 
 # --------- Config via env ---------
 QAS_PER_SNIPPET = int(os.getenv("EVAL_QAS_PER_SNIPPET", "3"))
-CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 MODEL_NAME = os.getenv("MODEL_NAME", "aya-expanse:8b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+
 
 # --------- Utils ---------
 def _now_ts() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime())
 
+
 def _slug(n: int = 6) -> str:
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
 
 def ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
+
 def _truncate(txt: str, n: int = 500) -> str:
     txt = (txt or "").replace("\n", " ").strip()
     return txt if len(txt) <= n else txt[: n - 1] + "…"
+
 
 def _json_safe(x):
     if isinstance(x, float):
@@ -63,6 +74,7 @@ def _json_safe(x):
     if isinstance(x, dict):
         return {k: _json_safe(v) for k, v in x.items()}
     return x
+
 
 # --- Minimal LangChain LLM that hits Ollama /api/generate (non-chat) ---
 class OllamaGenerateLLM(LLM):
@@ -76,11 +88,11 @@ class OllamaGenerateLLM(LLM):
         return "ollama_generate_httpx"
 
     def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager=None,
-        **kwargs: Any,
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager=None,
+            **kwargs: Any,
     ) -> str:
         payload: Dict[str, Any] = {"model": self.model, "prompt": prompt, "stream": False}
         opts = dict(self.options or {})
@@ -94,16 +106,19 @@ class OllamaGenerateLLM(LLM):
             data = r.json()
             return str(data.get("response") or "")
 
+
 # --- Embeddings shim via sentence-transformers (LangChain interface) ---
 class _LCEmb(LCEmb):
-    def __init__(self, model_name: str = "BAAI/bge-m3"):
-        self._st = SentenceTransformer(model_name)
+    def __init__(self, model_name: str = "BAAI/bge-m3", embedder=None):
+        from sentence_transformers import SentenceTransformer
+        self._st = embedder or SentenceTransformer(model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         return self._st.encode(texts, normalize_embeddings=True).tolist()
 
     def embed_query(self, text: str) -> List[float]:
         return self._st.encode([text], normalize_embeddings=True)[0].tolist()
+
 
 # --------- Ollama helpers ---------
 async def _ollama_complete(prompt: str, options: Optional[dict] = None, timeout: float = 120.0) -> str:
@@ -116,10 +131,11 @@ async def _ollama_complete(prompt: str, options: Optional[dict] = None, timeout:
         data = r.json()
         return str(data.get("response") or "")
 
+
 # --------- Chroma sampling ---------
 def _fetch_chroma_samples(limit_docs: int = 40) -> List[Dict[str, Any]]:
     client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
-    coll = client.get_or_create_collection("docs")
+    coll = get_collection(COLLECTION)
     data = coll.get(include=["metadatas", "documents"])
     ids = data.get("ids") or []
     metas = data.get("metadatas") or []
@@ -149,6 +165,7 @@ def _fetch_chroma_samples(limit_docs: int = 40) -> List[Dict[str, Any]]:
     random.shuffle(uniq)
     return uniq[:limit_docs]
 
+
 # --------- Q/A generation from a snippet ---------
 _QA_PROMPT = """You are an expert data annotator. Given the SOURCE SNIPPET below, write {n} factual Q&A pairs that can be answered using ONLY the snippet.
 
@@ -161,6 +178,7 @@ SOURCE ({source}:{start_line}-{end_line}):
 \"\"\"
 {snippet}
 \"\"\""""
+
 
 async def _generate_qas_from_snippet(snippet: Dict[str, Any], n: int = 1) -> List[Dict[str, Any]]:
     prompt = _QA_PROMPT.format(
@@ -185,6 +203,7 @@ async def _generate_qas_from_snippet(snippet: Dict[str, Any], n: int = 1) -> Lis
             })
     return items[:n]
 
+
 # --------- RAG answerer ---------
 async def _answer_with_rag(question: str) -> Tuple[str, List[str]]:
     retr = Retriever(k_initial=12, k_final=RAG_TOP_K, use_reranker=True)
@@ -196,6 +215,7 @@ async def _answer_with_rag(question: str) -> Tuple[str, List[str]]:
     full = f"{sys}\n\n# Context:\n{ctx_text}\n\n# Question:\n{question}\n\n# Answer:"
     answer = await _ollama_complete(full, options=None, timeout=120.0)
     return answer.strip(), contexts
+
 
 # --------- Public API ---------
 async def run_evaluation(limit: int = 25) -> Dict[str, Any]:
@@ -250,8 +270,9 @@ async def run_evaluation(limit: int = 25) -> Dict[str, Any]:
     eval_llm = LangchainLLMWrapper(
         OllamaGenerateLLM(base_url=OLLAMA_HOST, model=MODEL_NAME, http_timeout=60.0, options={"temperature": 0.0})
     )
-    eval_emb = LangchainEmbeddingsWrapper(_LCEmb(os.getenv("EMBED_MODEL", "BAAI/bge-m3")))
-
+    LangchainEmbeddingsWrapper(
+        _LCEmb(os.getenv("EMBED_MODEL", "BAAI/bge-m3"), embedder=get_embedder())
+    )
     eval_dataset = EvaluationDataset(samples=[
         SingleTurnSample(
             user_input=r["question"],
@@ -300,6 +321,7 @@ async def run_evaluation(limit: int = 25) -> Dict[str, Any]:
         json.dump(_json_safe(summary), f, ensure_ascii=False, indent=2)
 
     return summary
+
 
 def get_last_summary() -> Dict[str, Any]:
     out_dir = ensure_dir(os.path.join(os.path.dirname(__file__), "..", "logs", "ragas"))

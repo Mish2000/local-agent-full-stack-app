@@ -1,13 +1,13 @@
 # ===== FastAPI app =====
-fastapi
+fastapi~=0.116.1
 uvicorn[standard]
-python-dotenv
+python-dotenv~=1.1.1
 python-multipart
-httpx
+httpx~=0.28.1
 
 # ===== Database & ORM =====
-SQLAlchemy
-aiomysql          # MySQL async driver
+SQLAlchemy~=2.0.43
+aiomysql~=0.2.0
 aiosqlite         # SQLite async driver (safe to keep for local dev)
 
 # ===== Auth & Validation =====
@@ -17,16 +17,22 @@ cryptography      # required by MySQL 8's caching_sha2_password with PyMySQL/aio
 
 # ===== RAG / LLM stack =====
 torch
-sentence-transformers
-chromadb
-langchain-core
+sentence-transformers~=5.1.0
+chromadb~=1.0.20
+langchain-core~=0.3.75
 langchain-ollama
 ollama
 
 # ===== Evaluation & Datasets =====
-ragas
+ragas~=0.3.2
 datasets
-pandas
+pandas~=2.3.2
 
 # ===== Document ingestion =====
-docx2txt
+docx2txt~=0.9
+langfuse~=3.3.2
+
+
+pypdf~=6.0.0
+pydantic~=2.11.7
+requests~=2.32.5

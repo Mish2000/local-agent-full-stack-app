@@ -8,33 +8,30 @@ import tempfile
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
-# Silence Chroma telemetry
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
-
 import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
-
 import docx2txt
+from chromadb.config import Settings
 from pypdf import PdfReader
 
-# ---- Config via env (keeps consistent with retriever.py) ----
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
-CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "docs")
+from .common import (
+    CHROMA_DIR,
+    COLLECTION as CHROMA_COLLECTION,
+    get_collection, get_embedder,
+)
 
 TEXT_EXTS = {".txt", ".md"}
 DOCX_EXTS = {".docx"}
 PDF_EXTS = {".pdf"}
 
+
 # ---------------- File readers ----------------
 def ingest_bytes(
-    *,
-    filename: str,
-    data: bytes,
-    user_id: Optional[str] = None,
-    chat_id: Optional[str] = None,
-    collection: str = CHROMA_COLLECTION,
+        *,
+        filename: str,
+        data: bytes,
+        user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        collection: str = CHROMA_COLLECTION,
 ) -> int:
     """
     Index a single uploaded file into Chroma (scoped by user_id and/or chat_id).
@@ -56,12 +53,9 @@ def ingest_bytes(
         if not chunks:
             return 0
 
-        # 2) Open Chroma collection + embedder (same models/env you already use)
-        client = chromadb.PersistentClient(
-            path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False)
-        )
-        coll = client.get_or_create_collection(collection)
-        embedder = SentenceTransformer(EMBED_MODEL_NAME)
+        # 2) Open Chroma collection + embedder via common singletons
+        coll = get_collection(collection)
+        embedder = get_embedder()
 
         # 3) Build batch
         ids: List[str] = []
@@ -99,14 +93,17 @@ def ingest_bytes(
         except Exception:
             pass
 
+
 def read_text_file(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
+
 
 def read_docx_file(p: Path) -> str:
     try:
         return docx2txt.process(str(p)) or ""
     except Exception:
         return ""
+
 
 def read_pdf_file(p: Path) -> str:
     try:
@@ -115,6 +112,7 @@ def read_pdf_file(p: Path) -> str:
     except Exception:
         return ""
 
+
 # ---------------- Chunking ----------------
 def _normalize_whitespace(s: str) -> str:
     # normalize hard newlines but keep structure
@@ -122,6 +120,7 @@ def _normalize_whitespace(s: str) -> str:
     # strip trailing spaces on lines
     lines = [ln.rstrip() for ln in s.split("\n")]
     return "\n".join(lines).strip()
+
 
 def chunk_text(text: str, *, max_chars: int = 1200, min_chars: int = 400) -> List[Tuple[str, int, int]]:
     """
@@ -160,9 +159,11 @@ def chunk_text(text: str, *, max_chars: int = 1200, min_chars: int = 400) -> Lis
 
     return chunks
 
+
 # ---------------- Helpers ----------------
 def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
 
 def load_file(p: Path) -> str:
     ext = p.suffix.lower()
@@ -173,6 +174,7 @@ def load_file(p: Path) -> str:
     if ext in PDF_EXTS:
         return read_pdf_file(p)
     return ""
+
 
 # ---------------- Main ----------------
 def main() -> None:
@@ -188,10 +190,10 @@ def main() -> None:
         print(f"[ingest] Source not found: {src_path}")
         return
 
-    client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
-    coll = client.get_or_create_collection(args.collection)
+    chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
+    coll = get_collection(args.collection)
+    embedder = get_embedder()
 
-    embedder = SentenceTransformer(EMBED_MODEL_NAME)
     total_added = 0
 
     paths: List[Path]
@@ -243,6 +245,7 @@ def main() -> None:
         print(f"[ingest] {p.name}: {len(docs)} chunks")
 
     print(f"[ingest] Done. Added/updated {total_added} chunks to '{args.collection}' in {CHROMA_DIR}")
+
 
 if __name__ == "__main__":
     main()

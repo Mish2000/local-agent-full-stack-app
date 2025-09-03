@@ -1,5 +1,7 @@
 // src/lib/api.ts
-const API = "http://localhost:8000";
+import {extractHeaderBgFromSettings, setHeaderBackground} from "@/lib/theme";
+
+const API = import.meta.env.VITE_BACKEND_ORIGIN ?? "http://localhost:8000";
 
 export type ApiOptions<B = unknown> = {
     method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
@@ -67,7 +69,7 @@ export async function uploadDocs(
     const fd = new FormData();
     for (const f of files) fd.append("files", f);
 
-    const qs = new URLSearchParams({ scope });
+    const qs = new URLSearchParams({scope});
     if (scope === "chat" && typeof chatId === "number") {
         qs.set("chat_id", String(chatId));
     }
@@ -90,13 +92,13 @@ export async function listFiles(
     scope: "user" | "chat",
     chatId?: string | number
 ): Promise<FileItem[]> {
-    const qs = new URLSearchParams({ scope });
+    const qs = new URLSearchParams({scope});
     if (scope === "chat" && chatId != null) qs.set("chat_id", String(chatId));
     return api<FileItem[]>(`/files?${qs.toString()}`);
 }
 
 export async function deleteFile(fileId: number): Promise<{ ok: boolean }> {
-    return api<{ ok: boolean }>(`/files/${fileId}`, { method: "DELETE" });
+    return api<{ ok: boolean }>(`/files/${fileId}`, {method: "DELETE"});
 }
 
 export type StagedItem = {
@@ -107,7 +109,7 @@ export type StagedItem = {
 };
 
 export async function listStaged(draftId: string): Promise<StagedItem[]> {
-    const qs = new URLSearchParams({ draft_id: draftId });
+    const qs = new URLSearchParams({draft_id: draftId});
     return api<StagedItem[]>(`/files/stage?${qs.toString()}`);
 }
 
@@ -115,7 +117,7 @@ export async function unstage(
     draftId: string,
     sha256_hex: string
 ): Promise<{ ok: boolean }> {
-    const qs = new URLSearchParams({ draft_id: draftId });
+    const qs = new URLSearchParams({draft_id: draftId});
     return api<{ ok: boolean }>(
         `/files/stage/${encodeURIComponent(sha256_hex)}?${qs.toString()}`,
         {
@@ -181,18 +183,11 @@ export async function commitStaged(
         `/files/commit`,
         {
             method: "POST",
-            body: { draft_id: draftId, chat_id: chatId },
+            body: {draft_id: draftId, chat_id: chatId},
         }
     );
 }
 
-export type AgentMode = "offline" | "web" | "auto";
-
-export interface ModesItem {
-    id: AgentMode;
-    label: string;
-    desc: string;
-}
 
 export type ProfileSettings = {
     instruction_enabled: boolean;
@@ -209,55 +204,76 @@ export type AccountUpdate = {
 };
 
 export async function apiUpdateAccount(p: AccountUpdate): Promise<{ ok: boolean }> {
-    const r = await fetch(`${BASE}/profile/account`, {
+    const r = await fetch(`${API}/profile/account`, {
         method: "PUT",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: {"Content-Type": "application/json"},
         body: JSON.stringify(p),
     });
     if (!r.ok) throw new Error(`PUT /profile/account ${r.status}`);
     return r.json();
 }
 
-const BASE = import.meta.env.VITE_BACKEND_ORIGIN ?? "http://localhost:8000";
-
-export async function apiGetModes(): Promise<ModesItem[]> {
-    const r = await fetch(`${BASE}/modes`, { credentials: "include" });
-    if (!r.ok) throw new Error(`GET /modes ${r.status}`);
-    return r.json();
-}
-
 export async function apiGetProfileSettings(): Promise<ProfileSettings> {
-    const r = await fetch(`${BASE}/profile/settings`, { credentials: "include" });
+    const r = await fetch(`${API}/profile/settings`, {credentials: "include"});
     if (!r.ok) throw new Error(`GET /profile/settings ${r.status}`);
     return r.json();
 }
 
-/** Backend returns { ok: true } for PUT. */
+
 export async function apiPutProfileSettings(
     p: ProfileSettings
 ): Promise<{ ok: boolean }> {
-    const r = await fetch(`${BASE}/profile/settings`, {
+    const r = await fetch(`${API}/profile/settings`, {
         method: "PUT",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: {"Content-Type": "application/json"},
         body: JSON.stringify(p),
     });
     if (!r.ok) throw new Error(`PUT /profile/settings ${r.status}`);
-    return r.json();
+    const res: { ok: boolean } = await r.json();
+
+    // NEW: on success, emit the chosen header background (if present in the payload you send)
+    const css = extractHeaderBgFromSettings(p);
+    if (css) setHeaderBackground(css);
+
+    return res;
 }
 
+
+// POST /profile/avatar/upload
 export async function apiUploadAvatar(file: File): Promise<{ ok: boolean }> {
     const fd = new FormData();
     fd.append("file", file);
-    return api<{ ok: boolean }>("/profile/avatar/upload", {
+    const res = await api<{ ok: boolean }>("/profile/avatar/upload", {
         method: "POST",
         body: fd,
     });
+
+    // Uploaded avatar changed; tell UI to refresh
+    bumpAvatarVersion();
+    return res;
 }
+
 
 /** Helper for consistent avatar URL + cache-busting when needed. */
 export function avatarUrl(cacheBust = true): string {
-    const u = `${BASE}/profile/avatar`;
+    const u = `${API}/profile/avatar`;
     return cacheBust ? `${u}?t=${Date.now()}` : u;
 }
+
+// --- Broadcast avatar changes so Header can refresh in-place (same-tab + cross-tab) ---
+export function bumpAvatarVersion(): void {
+    try {
+        const ts = String(Date.now());
+        // Keep a version in localStorage (lets 'storage' fire cross-tab)
+        localStorage.setItem("avatar:v", ts);
+        // Dispatch a best-effort storage event for same-tab listeners
+        window.dispatchEvent(new StorageEvent("storage", {key: "avatar:v", newValue: ts}));
+        // Also dispatch a custom event (some browsers don't deliver synthetic StorageEvent to same tab)
+        window.dispatchEvent(new CustomEvent("avatar:updated", {detail: ts}));
+    } catch {
+        /* noop */
+    }
+}
+

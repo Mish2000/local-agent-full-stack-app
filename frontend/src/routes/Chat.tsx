@@ -1,20 +1,20 @@
 // src/routes/Chat.tsx
 import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {openChatSSE, type RagMode, type Source, type ToolEvent} from "@/lib/sse";
-import Header from "@/components/Header";
-import ChatMessage from "@/components/ChatMessage";
-import Composer from "@/components/Composer";
-import SourcesBar from "@/components/SourcesBar";
-import ToolCalls from "@/components/ToolCalls";
-import TracesBar from "@/components/TracesBar";
+import Header from "@/features/layout/Header.tsx";
+import ChatMessage from "@/features/chat/ChatMessage.tsx";
+import Composer from "@/features/chat/Composer.tsx";
+import SourcesBar from "@/features/chat/SourcesBar.tsx";
+import ToolCalls from "@/features/chat/ToolCalls.tsx";
+import TracesBar from "@/features/chat/TracesBar.tsx";
 import {type Dir, detectDir, looksLikeCode} from "@/lib/text";
 import {ArrowDown} from "lucide-react";
 import {toast} from "sonner";
-import Sidebar from "@/components/Sidebar";
-import ExportPDF from "@/components/ExportPDF";
+import Sidebar from "@/features/layout/Sidebar.tsx";
+import ExportPDF from "@/features/chat/ExportPDF.tsx";
 // Removed usePerChatMode + setChatMode to avoid resets; we use the new hook:
 import {saveLastForChat, loadLastForChat, clearLastForChat} from "@/lib/reasoningStorage";
-import AttachmentsShelf from "@/components/AttachmentsShelf";
+import AttachmentsShelf from "@/features/chat/AttachmentsShelf.tsx";
 import DragDropOverlay from "@/components/DragDropOverlay";
 import {useChatMode} from "@/lib/modes";
 
@@ -477,6 +477,7 @@ export default function Chat({variant = "full"}: { variant?: Variant }) {
                 await commitStaged(draftId, ensureChatId);
                 setDraftId(null);
                 setStaged([]);
+                setFilesRefreshKey((v) => v + 1);
                 refreshStaged();
             }
         } catch {
@@ -683,24 +684,22 @@ export default function Chat({variant = "full"}: { variant?: Variant }) {
 
                     {/* Chat column (relative to host overlay) */}
                     <div ref={chatColumnRef} className="relative flex-1 min-w-0">
+                        {/* Static attachments shelf (pinned) */}
+                        {attachmentsEnabled && (
+                            <div className="block absolute left-4 top-3 z-20">
+                                <AttachmentsShelf
+                                    chatId={activeChatId}
+                                    draftId={draftId}
+                                    staged={staged}
+                                    onRefreshStaged={refreshStaged}
+                                    refreshKey={filesRefreshKey}
+                                />
+                            </div>
+                        )}
+
                         {/* Messages scroller */}
                         <div ref={chatRef} className="chat px-4">
                             {!isGuest && loadingChats && <div className="opacity-70 py-4">טוען היסטוריית שיחות…</div>}
-
-                            {/* Left attachments shelf */}
-                            {attachmentsEnabled && (
-                                <div className="w-full pb-6">
-                                    <div>
-                                        <AttachmentsShelf
-                                            chatId={activeChatId}
-                                            draftId={draftId}
-                                            staged={staged}
-                                            onRefreshStaged={refreshStaged}
-                                            refreshKey={filesRefreshKey}
-                                        />
-                                    </div>
-                                </div>
-                            )}
 
                             {/* Blank state */}
                             {!isGuest && !activeChatId && messages.length === 0 && (

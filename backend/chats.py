@@ -9,7 +9,7 @@ from sqlalchemy import select, func, desc, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_db, _current_user  # reuse existing helpers
-from models import Chat, ChatMessage, User, utcnow
+from models import Chat, ChatMessage, User, ilnow
 
 router = APIRouter(prefix="/chats", tags=["chats"])
 
@@ -91,7 +91,7 @@ async def list_chats(request: Request, db: AsyncSession = Depends(get_db)):
 @router.post("", response_model=ChatOut)
 async def create_chat(body: ChatCreateIn, request: Request, db: AsyncSession = Depends(get_db)):
     user = await _require_user(request, db)
-    now = utcnow()
+    now = ilnow()
     chat = Chat(user_id=user.id, title=body.title or "New chat", created_at=now, updated_at=now)
     db.add(chat)
     await db.commit()
@@ -103,7 +103,7 @@ async def rename_chat(chat_id: int, body: ChatRenameIn, request: Request, db: As
     user = await _require_user(request, db)
     chat = await _require_chat(db, user.id, chat_id)
     chat.title = body.title
-    chat.updated_at = utcnow()
+    chat.updated_at = ilnow()
     await db.commit()
     await db.refresh(chat)
     return ChatOut(id=chat.id, title=chat.title, updated_at=chat.updated_at, last_preview=None)

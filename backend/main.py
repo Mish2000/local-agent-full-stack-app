@@ -2,22 +2,24 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
 import uuid
-import logging
 from pathlib import Path
+from collections import deque
 from typing import AsyncGenerator, Dict, Tuple
 from typing import List
 from typing import Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
-from aiomysql import sa
 from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI
 from fastapi import Form, Query, Body
@@ -67,6 +69,7 @@ def _load_env_file(path: str) -> None:
 
 # Load backend/.env if present
 _load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
+IL_TZ = ZoneInfo("Asia/Jerusalem")
 
 # --------- Settings (env-driven) ---------
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
@@ -81,9 +84,68 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 STAGED_DIR = Path(os.getenv("STAGED_DIR") or (Path(__file__).parent / "uploads_staged"))
 STAGED_DIR.mkdir(parents=True, exist_ok=True)
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".rst", ".csv", ".json", ".log"}
+_DOCX_EXTS = {".docx"}
+_PDF_EXTS = {".pdf"}
 AVATAR_DIR = UPLOAD_DIR / "avatars"
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 _ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
+
+# --- AUTO routing helpers (drop under your other helpers in main.py) ---
+_RECENCY_TERMS_EN = (
+    "current", "today", "now", "this week", "latest", "live", "breaking",
+    "price", "rate", "exchange rate", "forecast", "weather", "score", "result"
+)
+_RECENCY_TERMS_HE = (
+    "עכשיו", "היום", "עדכני", "מעודכן", "חיים", "מחיר", "שער", "שער החליפין",
+    "תחזית", "מזג אוויר", "תוצאה", "תוצאות", "חדשות", "אחרונות"
+)
+_CURRENCY_LIKE = (
+    "usd", "eur", "ils", "$", "€", "₪",
+    "dollar", "euro", "shekel", "exchange rate", "fx",
+    "דולר", "אירו", "שקל", "שער הדולר", "שער האירו", "שער השקל"
+)
+_CRYPTO_LIKE = (
+    "bitcoin", "btc", "ether", "eth", "קריפטו", "ביטקוין", "אתריום",
+    "altcoin", "token", "coin", "מחיר ביטקוין", "מחיר אתריום"
+)
+_WEATHER_LIKE = ("weather", "forecast", "מזג אוויר", "תחזית")
+_SPORTS_LIKE = ("score", "scores", "result", "nba", "nfl", "mlb", "nhl",
+                "תוצאה", "ליגה", "מונדיאל", "תוצאות")
+
+
+def _needs_recency(q: str) -> bool:
+    qn = (q or "").lower()
+    return any(t in qn for t in _RECENCY_TERMS_EN) or any(t in q for t in _RECENCY_TERMS_HE)
+
+
+def _classify_web_strategy(q: str) -> dict:
+    """
+    Decide topic + recency window for WebSearcher. Returns kwargs for WebSearcher.search.
+    """
+    qn = (q or "").lower()
+    topic = None
+    days = None
+
+    if any(t in qn for t in _CURRENCY_LIKE):
+        topic, days = "fx", 1
+    elif any(t in qn for t in _CRYPTO_LIKE):
+        topic, days = "crypto", 1
+    elif any(t in qn for t in _WEATHER_LIKE):
+        topic, days = "weather", 3
+    elif any(t in qn for t in _SPORTS_LIKE):
+        topic, days = "sports", 3
+    elif _needs_recency(q):
+        topic, days = "news", 3
+
+    # Conservative default if we couldn't classify but still want recency
+    if days is None and _needs_recency(q):
+        days = 7
+
+    return {
+        "topic": topic,  # WebSearcher understands topic; safe to be None
+        "days": days,  # Prefer tight windows when recognized
+        "auto_parameters": True,  # Let provider layer tighten freshness/quality
+    }
 
 
 def _is_local_ollama(url: str) -> bool:
@@ -166,20 +228,6 @@ async def ensure_ollama_running() -> None:
 logger = logging.getLogger(__name__)
 
 
-def ensure_windows_service_running(service: str) -> None:
-    """If on Windows and service not RUNNING, try to start it. Best-effort, never raises."""
-    if os.name != "nt":
-        return
-    try:
-        q = subprocess.run(["sc", "query", service], capture_output=True, text=True, check=False)
-        out = (q.stdout or "") + (q.stderr or "")
-        if "RUNNING" in out:
-            return
-        subprocess.run(["sc", "start", service], capture_output=True, text=True, check=False)
-    except Exception as e:
-        logger.warning("Failed to ensure Windows service %s is running: %s", service, e)
-
-
 async def current_user_dep(request: Request, db=Depends(get_db)) -> Optional[User]:
     # Delegate to your real helper
     return await _current_user(request, db)
@@ -241,6 +289,25 @@ def _list_staged_items(user_id: int, draft_id: str) -> list[dict]:
     items.sort(key=lambda it: (_draft_folder(user_id, draft_id) / it["sha256_hex"] / it["filename"]).stat().st_mtime,
                reverse=True)
     return items
+
+
+def _read_docx_path(path: Path) -> Optional[str]:
+    try:
+        import docx2txt  # lightweight; used in backend/rag/ingest.py as well
+        txt = docx2txt.process(str(path)) or ""
+        return txt.strip() or None
+    except Exception:
+        return None
+
+
+def _read_pdf_path(path: Path) -> Optional[str]:
+    try:
+        from pypdf import PdfReader  # lightweight; used in backend/rag/ingest.py as well
+        reader = PdfReader(str(path))
+        txt = "\n".join(page.extract_text() or "" for page in reader.pages)
+        return (txt or "").strip() or None
+    except Exception:
+        return None
 
 
 async def _ensure_user_profile_columns(db: AsyncSession) -> None:
@@ -318,7 +385,7 @@ class ProfileSettingsIO(BaseModel):
 
 
 # Tools
-from tools.web_search import WebSearcher
+from tools.web_search import WebSearcher, _parse_date_heuristic
 from tools.py_eval import run_python
 
 app = FastAPI()
@@ -344,7 +411,6 @@ app.include_router(chats_router)
 @app.on_event("startup")
 async def _on_startup():
     await ensure_ollama_running()
-    ensure_windows_service_running("MySQL80")
     await init_db(Base)
 
 
@@ -513,44 +579,68 @@ def _read_text_from_path(path: Path, max_chars: int = 6000) -> Optional[str]:
     return txt
 
 
-async def _fallback_docs_for_chat(db: AsyncSession, user_id: int, chat_id: int,
-                                  max_files: int = 3, per_file_chars: int = 6000) -> List[Dict]:
+async def _fallback_docs_for_chat(
+        db: AsyncSession,
+        user_id: int,
+        chat_id: int,
+        max_files: int = 3,
+        per_file_chars: int = 6000,
+) -> List[Dict]:
     """
-    Load recent text-like files for this chat directly from disk as a last-resort
-    context when the vector retriever returns nothing (e.g., empty/generic query).
+    Load recent files for this chat directly from disk as last-resort context
+    when the vector retriever returns nothing (e.g., empty/generic query).
+
+    Now supports TXT/MD/CSV/JSON/LOG *and* PDF/DOCX.
     """
     rows = (
         await db.execute(
-            select(FileMeta).where(
-                FileMeta.user_id == user_id,
-                FileMeta.chat_id == chat_id
-            ).order_by(FileMeta.created_at.desc()).limit(max_files)
+            select(FileMeta)
+            .where(FileMeta.user_id == user_id, FileMeta.chat_id == chat_id)
+            .order_by(FileMeta.created_at.desc())
+            .limit(max_files)
         )
     ).scalars().all()
+
     out: List[Dict] = []
     for r in rows:
         if not r.sha256_hex:
             continue
         path = UPLOAD_DIR / str(user_id) / r.sha256_hex / r.filename
-        if not path.exists():
+        if not path.exists() or not path.is_file():
             continue
+
         ext = path.suffix.lower()
-        if ext not in _TEXT_EXTS:
-            # Keep it conservative: only plain-text-ish files in fallback.
+        txt: Optional[str] = None
+
+        if ext in _TEXT_EXTS:
+            txt = _read_text_from_path(path, max_chars=per_file_chars)
+        elif ext in _DOCX_EXTS:
+            txt = _read_docx_path(path)
+            if txt and len(txt) > per_file_chars:
+                txt = txt[: per_file_chars - 1] + "…"
+        elif ext in _PDF_EXTS:
+            txt = _read_pdf_path(path)
+            if txt and len(txt) > per_file_chars:
+                txt = txt[: per_file_chars - 1] + "…"
+        else:
+            # Keep future-proof: unknown types skipped here.
             continue
-        txt = _read_text_from_path(path, max_chars=per_file_chars)
+
         if not txt:
             continue
+
         # Provide a doc entry compatible with build_context()
-        # Use rough line numbers for simple preview
         lines = txt.count("\n") + 1
-        out.append({
-            "text": txt,
-            "source": r.filename,
-            "start_line": 1,
-            "end_line": lines,
-            "score": 1.0,
-        })
+        out.append(
+            {
+                "text": txt,
+                "source": r.filename,
+                "start_line": 1,
+                "end_line": lines,
+                "score": 1.0,
+            }
+        )
+
     return out
 
 
@@ -739,13 +829,37 @@ async def _probe_retrieval(user_query: str) -> Tuple[bool, List[Dict], str]:
 
 # ---------------------- Diagnostics ----------------------
 @app.get("/tools/web/test")
-async def web_test(q: str = Query(..., description="Query")):
+async def web_test(
+        q: str = Query(..., description="Query"),
+        time_range: str | None = Query(None, pattern="^(day|week|month|year|d|w|m|y)$"),
+        days: int | None = Query(None, ge=1, le=365),
+        topic: str | None = Query(None, pattern="^(news|general)$"),
+):
     ws = WebSearcher()
-    items, provider, debug, timed_out = await ws.search(q, max_results=5, timeout=15.0, time_budget_sec=10.0)
+    items, provider, debug, timed_out = await ws.search(
+        q,
+        max_results=5,
+        timeout=15.0,
+        time_budget_sec=12.0,
+        topic=topic,
+        time_range=time_range,
+        days=days,
+        auto_parameters=True,
+    )
+    # age stats for quick sanity
+    ages = []
+    for it in items:
+        d = _parse_date_heuristic(it)
+        if d:
+            ages.append((dt.date.today() - d).days)
+    age_stats = {"min": min(ages) if ages else None, "median": (sorted(ages)[len(ages) // 2] if ages else None),
+                 "max": max(ages) if ages else None}
+
     return {
         "provider": provider,
         "count": len(items),
         "debug": debug + [f"timed_out={1 if timed_out else 0}"],
+        "age_stats": age_stats,
         "items": items,
     }
 
@@ -793,13 +907,19 @@ def _base_system_prompt(
     """
     Build the base system prompt according to the selected mode.
 
+    Language rule (restores original Hebrew-first behavior for local docs):
+      - If the user's question OR any provided context contains Hebrew characters,
+        answer in Hebrew.
+      - Otherwise answer in {lang}.
+
     - mode="web": prefer recency and credible sources from web context.
     - mode="offline": never use the web; prefer local/personal context.
     - other/general: neutral guidance.
 
     When personal_extra is non-empty AND user enabled it in profile settings,
-    it is appended as "Personal instructions" so the LLM follows them globally.
+    it is appended as "Personal instructions".
     """
+    # Policy strictness
     if strict:
         policy = (
             "Use ONLY the provided context. If it is insufficient or not relevant, say so briefly and do not invent content."
@@ -810,6 +930,7 @@ def _base_system_prompt(
             "Be concise and avoid hallucinations."
         )
 
+    # Recency/web mode hint
     web_note = ""
     if mode == "web":
         web_note = (
@@ -833,7 +954,15 @@ def _base_system_prompt(
         else ""
     )
 
-    return f"You are a helpful assistant. Always answer in {lang}. {policy}{web_note}{tools_rules}{timeout_note}{personal_section}"
+    # Key language instruction (Hebrew-first when appropriate)
+    lang_rule = (
+        f"Language: If the question or any provided context contains Hebrew characters, answer in Hebrew. "
+        f"Otherwise answer in {lang}."
+    )
+
+    return (
+        f"You are a helpful assistant. {lang_rule} {policy}{web_note}{tools_rules}{timeout_note}{personal_section}"
+    )
 
 
 def build_prompt_single(
@@ -868,11 +997,18 @@ def build_prompt_mixed(
         history_text: str = "",
         personal_extra: str = "",
 ) -> str:
+    """
+    Mixed-context builder. Language rule:
+      - If the question OR either context includes Hebrew characters, answer in Hebrew.
+      - Otherwise answer in {lang}.
+    """
     sys = (
-        f"You are a helpful assistant. Always answer in {lang}. "
-        f"Consider TWO context sections: (A) Local documents and (B) Web articles. "
-        f"Decide relevance: prefer (B) for breaking news/current facts; prefer (A) when the ask references an uploaded file, example, lines, or internal docs. "
-        f"If both are relevant, synthesize. If neither is relevant, say so briefly. Be concise and avoid hallucinations."
+        "You are a helpful assistant. "
+        f"Language rule: If the question or any provided context contains Hebrew characters, answer in Hebrew. "
+        f"Otherwise answer in {lang}. "
+        "Consider TWO context sections: (A) Local documents and (B) Web articles. "
+        "Decide relevance: prefer (B) for breaking news/current facts; prefer (A) when the ask references an uploaded file, example, lines, or internal docs. "
+        "If both are relevant, synthesize. If neither is relevant, say so briefly. Be concise and avoid hallucinations."
     )
     if (personal_extra or "").strip():
         sys += f"\nPersonal instructions from the user (honor when compatible with policy):\n{personal_extra}\n"
@@ -925,9 +1061,10 @@ def _sanitize_web_query(text: str) -> str:
 @app.post("/rag/upload")
 async def rag_upload(
         request: Request,
-        # Accept BOTH "files" (multi) and "file" (single)
+        # Accept three common names: "files" (multi), "file" (single), "attachments" (multi)
         files: Optional[List[UploadFile]] = File(None, alias="files"),
         file: Optional[UploadFile] = File(None, alias="file"),
+        attachments: Optional[List[UploadFile]] = File(None, alias="attachments"),
         # Accept scope and chat_id from query OR from form-data
         scope_q: Optional[str] = Query(None),
         scope_f: Optional[str] = Form(None),
@@ -936,7 +1073,7 @@ async def rag_upload(
         db: AsyncSession = Depends(get_db),
 ):
     """
-    Upload TXT/PDF/DOCX/MD → persist file bytes+metadata AND chunk+embed into Chroma.
+    Upload TXT/PDF/DOCX/MD/CSV/JSON/LOG → persist file bytes+metadata AND chunk+embed into Chroma.
     Scope:
       - "user": global docs (chat_id NULL)
       - "chat": docs attached to a specific chat
@@ -945,14 +1082,20 @@ async def rag_upload(
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    # Collect uploads
+    # Collect uploads from all accepted aliases
     uploads: List[UploadFile] = []
     if files:
         uploads.extend(files)
+    if attachments:
+        uploads.extend(attachments)
     if file:
         uploads.append(file)
+
     if not uploads:
-        raise HTTPException(status_code=400, detail='No files provided. Use "files" (multi) or "file" (single).')
+        raise HTTPException(
+            status_code=400,
+            detail='No files provided. Use "files" (multi), "attachments" (multi), or "file" (single).',
+        )
 
     # Scope resolution
     scope = (scope_q or scope_f or "user").strip().lower()
@@ -978,80 +1121,85 @@ async def rag_upload(
     rejected: List[str] = []
 
     for up in uploads:
+        filename = up.filename or "file"
         try:
             data = await up.read()
-            dest_path, sha_hex = _save_user_file(uid, data, up.filename)
-            size_bytes = len(data)
+        except Exception:
+            rejected.append(filename)
+            continue
 
-            # PRE-CHECK: if this (user, sha) already exists, update it to point to this chat (if scope=chat).
-            stmt = select(FileMeta).where(
-                FileMeta.user_id == uid,
-                FileMeta.sha256_hex == sha_hex,
-            ).limit(1)
-            existing = (await db.execute(stmt)).scalar_one_or_none()
+        try:
+            dest_path, sha_hex = _save_user_file(uid, data, filename)
+            size_bytes = len(data)
+            mime = up.content_type or ""
+
+            # Upsert simple metadata row
+            existing = (
+                await db.execute(
+                    select(FileMeta).where(FileMeta.user_id == uid, FileMeta.sha256_hex == sha_hex).limit(1)
+                )
+            ).scalar_one_or_none()
 
             if existing:
-                # Align metadata and chat binding (move from global → chat, or keep as-is)
                 changed = False
                 if existing.filename != dest_path.name:
                     existing.filename = dest_path.name
                     changed = True
-                if existing.mime != up.content_type:
-                    existing.mime = up.content_type
+                if (existing.mime or "") != mime:
+                    existing.mime = mime
                     changed = True
                 if existing.size_bytes != size_bytes:
                     existing.size_bytes = size_bytes
                     changed = True
+                # If the caller wants this bound to a chat, move it there
                 if cid is not None and existing.chat_id != cid:
                     existing.chat_id = cid
                     changed = True
                 if changed:
                     await db.commit()
             else:
-                # Fresh row
                 fm = FileMeta(
                     user_id=uid,
                     chat_id=cid,
-                    filename=dest_path.name,
-                    mime=up.content_type,
-                    size_bytes=size_bytes,
                     sha256_hex=sha_hex,
+                    filename=dest_path.name,
+                    size_bytes=size_bytes,
+                    mime=mime,
                 )
                 db.add(fm)
                 await db.commit()
 
-            # Embed into Chroma — accept even if 0 chunks (tiny files)
-            try:
-                added = ingest_bytes(filename=up.filename, data=data, user_id=ns_user, chat_id=ns_chat)
-                if added > 0:
-                    total_chunks += added
-                accepted.append(up.filename)
-            except Exception:
-                # Save succeeded, but indexing failed => still accept the file itself
-                accepted.append(up.filename)
+            # Index into Chroma (works for txt/md/csv/json/log + pdf/docx)
+            added = ingest_bytes(
+                filename=dest_path.name,
+                data=data,
+                user_id=ns_user,
+                chat_id=ns_chat,
+            )
+            total_chunks += int(added or 0)
+            accepted.append(dest_path.name)
 
         except Exception:
-            rejected.append(up.filename)
+            rejected.append(filename)
 
     return {
         "ok": True,
         "scope": scope,
-        "chat_id": ns_chat,
-        "files_received": len(uploads),
-        "files_indexed": len(accepted),
-        "files_skipped": rejected,
-        "chunks": total_chunks,
+        "chat_id": cid,
+        "accepted": accepted,
+        "rejected": rejected,
+        "total_chunks": total_chunks,
     }
 
 
 @app.get("/chat/stream")
 async def chat_stream(
-    q: str = Query(..., description="User query"),
-    mode: str = Query("auto", pattern="^(auto|offline|web)$"),
-    cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
-    chat_id: Optional[int] = Query(None, ge=1),
-    scope: str = Query("user", pattern="^(user|chat)$"),
-    request: Request = None,
+        q: str = Query(..., description="User query"),
+        mode: str = Query("auto", pattern="^(auto|offline|web)$"),
+        cid: str = Query("default", min_length=1, max_length=64, pattern=r"^[\w\-]+$"),
+        chat_id: Optional[int] = Query(None, ge=1),
+        scope: str = Query("user", pattern="^(user|chat)$"),
+        request: Request = None,
 ):
     """
     Modes:
@@ -1085,7 +1233,7 @@ async def chat_stream(
             if not chat_obj:
                 return
             dbp.add(ChatMessage(chat_id=chat_obj.id, role="assistant", content=content))
-            chat_obj.updated_at = dt.datetime.now(dt.timezone.utc)
+            chat_obj.updated_at = dt.datetime.now(IL_TZ)
             await dbp.commit()
 
     async def gen() -> AsyncGenerator[bytes, None]:
@@ -1280,6 +1428,7 @@ async def chat_stream(
                     k_final=int(os.getenv("RAG_TOP_K", "5")),
                     use_reranker=True,
                 )
+
                 rag_docs = retriever.retrieve(q, where=rag_where)
 
                 # Fallback: recent chat files as context if nothing retrieved (chat scope)
@@ -1289,6 +1438,7 @@ async def chat_stream(
                     if fd:
                         rag_docs = fd
 
+                # RAG context (always probe + emit trace so user sees why we did/didn't use it)
                 ctx_rag = build_context(q, rag_docs)
                 yield sse("tool", json.dumps({
                     "name": "retrieve_knowledge_probe",
@@ -1299,7 +1449,7 @@ async def chat_stream(
                     trace_id, "retrieve_knowledge_probe", {"query": q, "where": rag_where}, ctx_rag["citations"]
                 )
 
-                # --- gating between RAG and Web (as in your current version)
+                # Strength estimate for local fit
                 rag_keywords = _extract_keywords(q)
                 overlap = 0
                 if rag_keywords and rag_docs:
@@ -1310,18 +1460,29 @@ async def chat_stream(
                 if rag_docs and isinstance(rag_docs[0].get("distance", None), (int, float)):
                     top_dist = float(rag_docs[0]["distance"])
 
-                doc_hint = _heuristic_wants_rag(q)  # user mentions "document/file/lines/etc."
-                rag_strong = bool(
+                doc_hint = _heuristic_wants_rag(q)  # mention of “document/file/lines…”
+                rag_strong = bool(rag_docs) or bool(
                     doc_hint and (
-                        (overlap >= 2) or
-                        (top_dist is not None and top_dist < 0.40)
+                            (overlap >= 1) or
+                            (top_dist is not None and top_dist < 0.60)
                     )
                 )
 
-                wants_web = _is_time_sensitive(q) or _heuristic_wants_web(q) or (not rag_strong)
+                # Decide if we ALSO need the web. We’re stricter here:
+                # - Always use web for clearly time-sensitive or market questions (even if RAG is strong).
+                # - If RAG is weak, use web as well.
+                needs_fresh = _needs_recency(q) or any(
+                    t in (q or "").lower() for t in _CURRENCY_LIKE + _CRYPTO_LIKE + _WEATHER_LIKE + _SPORTS_LIKE)
+                wants_web = needs_fresh or (not rag_strong)
+
+                citations_combined: List[Dict] = []
+                prompt: str
+                timed_out_note = None
+                used_tool = False
 
                 if wants_web:
-                    decision = await _classify_with_llm(q)  # best-effort; for trace only
+                    # Best-effort decision summary (for trace only)
+                    decision = await _classify_with_llm(q)
                     yield sse("tool", json.dumps({
                         "name": "auto_decision",
                         "args": {"query": q},
@@ -1331,6 +1492,8 @@ async def chat_stream(
 
                     ws = WebSearcher()
                     sanitized = _sanitize_web_query(q) or (q[:200] if q else "")
+                    ws_args = _classify_web_strategy(q)  # <-- NEW: topic+days+auto_parameters
+
                     items: List[Dict] = []
                     provider = "none"
                     debug: Dict = {}
@@ -1341,24 +1504,29 @@ async def chat_stream(
                             max_results=6,
                             timeout=20.0,
                             time_budget_sec=60.0,
+                            **ws_args,
                         )
                     except Exception as e:
                         debug = {"error": str(e)}
 
                     yield sse("tool", json.dumps({
                         "name": "web_search",
-                        "args": {"query": sanitized or "(skipped)"},
+                        "args": {"query": sanitized or "(skipped)",
+                                 **{k: v for k, v in ws_args.items() if v is not None}},
                         "result": {"provider": provider, "count": len(items)},
                         "debug": debug,
                     }, ensure_ascii=False))
                     tracer_local.log_tool(
-                        trace_id, "web_search", {"query": sanitized or "(skipped)"},
-                        {"provider": provider, "count": len(items)}
+                        trace_id, "web_search",
+                        {"query": sanitized or "(skipped)", **{k: v for k, v in ws_args.items() if v is not None}},
+                        {"provider": provider, "count": len(items)},
                     )
                     used_tool = True
                     timed_out_note = "Web search timed out; proceeding with partial context." if timed_out else None
 
                     ctx_web = build_web_context(q, items)
+
+                    # Combine: attached file(s) / RAG first, then fresh web (if any)
                     citations_combined = (ctx_rag["citations"] or []) + (ctx_web["citations"] or [])
                     prompt = build_prompt_mixed(
                         q,
@@ -1369,6 +1537,7 @@ async def chat_stream(
                         personal_extra=personal_extra,
                     )
                 else:
+                    # Purely local (RAG/offline)
                     citations_combined = ctx_rag["citations"]
                     prompt = build_prompt_single(
                         q,
@@ -1379,7 +1548,6 @@ async def chat_stream(
                         history_text=history_text,
                         personal_extra=personal_extra,
                     )
-
             # ------------------- STREAM & PERSIST ASSISTANT (all non-python paths) -------------------
             assistant_chunks: List[str] = []
             had_error = False
@@ -1411,8 +1579,6 @@ async def chat_stream(
             return
 
     return StreamingResponse(gen(), media_type="text/event-stream")
-
-
 
 
 @app.post("/chats/{chat_id}/auto-title")
@@ -1845,7 +2011,7 @@ async def upload_avatar(
     prof.avatar_mime = file.content_type
     prof.avatar_kind = "upload"
     prof.avatar_value = ""
-    prof.avatar_updated_at = dt.datetime.now(dt.timezone.utc)
+    prof.avatar_updated_at = dt.datetime.now(IL_TZ)
 
     await db.commit()
     return {"ok": True}

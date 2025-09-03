@@ -1,5 +1,5 @@
 // src/routes/Profile.tsx
-import { useEffect, useMemo, useRef, useState } from "react";
+import {useEffect, useMemo, useRef, useState} from "react";
 import {
     apiGetProfileSettings,
     apiPutProfileSettings,
@@ -7,27 +7,27 @@ import {
     type ProfileSettings,
     avatarUrl,
 } from "@/lib/api";
-import { Button } from "@/components/ui/button";
-import { Link, useNavigate } from "react-router-dom";
-import AccountSection from "@/components/AccountSection";
+import {useAuth} from "@/lib/useAuth";
+import {Button} from "@/components/ui/button";
+import {Link, useNavigate} from "react-router-dom";
+import AccountSection from "@/features/layout/AccountSection.tsx";
 
 
 type Preset = { id: string; label: string; grad: string };
 
 const PRESETS: Preset[] = [
-    { id: "sys-1", label: "כחול", grad: "from-indigo-500 to-sky-500" },
-    { id: "sys-2", label: "סגול/ורוד", grad: "from-fuchsia-500 to-pink-500" },
-    { id: "sys-3", label: "ירקרק", grad: "from-emerald-500 to-teal-500" },
-    { id: "sys-4", label: "כתום", grad: "from-amber-500 to-orange-500" },
-    { id: "sys-5", label: "סגול", grad: "from-violet-500 to-purple-500" },
-    { id: "sys-6", label: "אדום", grad: "from-rose-500 to-red-500" },
-    { id: "sys-7", label: "ליים/ירוק", grad: "from-lime-500 to-green-500" },
-    { id: "sys-8", label: "אפור/שחור", grad: "from-slate-500 to-zinc-700" },
+    {id: "sys-1", label: "כחול", grad: "from-indigo-500 to-sky-500"},
+    {id: "sys-2", label: "סגול/ורוד", grad: "from-fuchsia-500 to-pink-500"},
+    {id: "sys-3", label: "ירקרק", grad: "from-emerald-500 to-teal-500"},
+    {id: "sys-4", label: "כתום", grad: "from-amber-500 to-orange-500"},
+    {id: "sys-5", label: "סגול", grad: "from-violet-500 to-purple-500"},
+    {id: "sys-6", label: "אדום", grad: "from-rose-500 to-red-500"},
+    {id: "sys-7", label: "ליים/ירוק", grad: "from-lime-500 to-green-500"},
+    {id: "sys-8", label: "אפור/שחור", grad: "from-slate-500 to-zinc-700"},
 ];
 
 export default function Profile() {
-    const nav = useNavigate();
-
+    useNavigate();
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [msg, setMsg] = useState<string>("");
@@ -48,7 +48,14 @@ export default function Profile() {
         (async () => {
             try {
                 const s = await apiGetProfileSettings();
-                if (mounted) setForm({ ...s });
+                if (mounted) {
+                    setForm({
+                        instruction_enabled: !!s.instruction_enabled,
+                        instruction_text: s.instruction_text ?? "",
+                        avatar_kind: s.avatar_kind ?? "",
+                        avatar_value: s.avatar_value ?? "",
+                    });
+                }
             } catch {
                 /* ignore */
             } finally {
@@ -59,7 +66,9 @@ export default function Profile() {
             mounted = false;
             if (previewUrl) URL.revokeObjectURL(previewUrl);
         };
-    }, [previewUrl]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
 
     const onSave = async () => {
         setSaving(true);
@@ -71,6 +80,7 @@ export default function Profile() {
                 avatar_kind: form.avatar_kind || "",
                 avatar_value: form.avatar_value || "",
             });
+            await refresh();
             setMsg("נשמר בהצלחה.");
             // If using system avatar or after upload, drop any object URL and reload from server
             if (previewUrl) {
@@ -85,7 +95,7 @@ export default function Profile() {
     };
 
     const onPickSystemAvatar = (id: string) => {
-        setForm((f) => ({ ...f, avatar_kind: "system", avatar_value: id }));
+        setForm((f) => ({...f, avatar_kind: "system", avatar_value: id}));
         setPreviewUrl("");
         setShowPresets(true);
     };
@@ -100,7 +110,7 @@ export default function Profile() {
             const url = URL.createObjectURL(f);
             setPreviewUrl(url);
             await apiUploadAvatar(f);
-            setForm((prev) => ({ ...prev, avatar_kind: "upload", avatar_value: "" }));
+            setForm((prev) => ({...prev, avatar_kind: "upload", avatar_value: ""}));
             setMsg("התמונה הועלתה.");
         } catch (e: unknown) {
             setMsg(e instanceof Error ? e.message : "העלאה נכשלה");
@@ -110,16 +120,32 @@ export default function Profile() {
         }
     };
 
+    const { me, refresh } = useAuth();
+
+
     const avatarNode = useMemo(() => {
+        const initial =
+            ((me?.display_name || me?.email || "").trim().charAt(0) || "?").toUpperCase();
+
         if (form.avatar_kind === "upload") {
             const src = previewUrl || avatarUrl(true);
-            return <img src={src} alt="תמונת פרופיל" className="size-20 rounded-full object-cover" />;
+            return (
+                <img
+                    src={src}
+                    alt="תמונת פרופיל"
+                    className="size-20 rounded-full object-cover"
+                />
+            );
         }
         if (form.avatar_kind === "system" && form.avatar_value) {
             const preset = PRESETS.find((a) => a.id === form.avatar_value) ?? PRESETS[0];
             return (
-                <div className={`size-20 rounded-full bg-gradient-to-br ${preset.grad} grid place-items-center text-white`}>
-                    <span className="text-xl">🙂</span>
+                <div
+                    className={`size-20 rounded-full bg-gradient-to-br ${preset.grad} grid place-items-center text-white`}
+                    title={me?.display_name || ""}
+                    aria-label={`Avatar ${initial}`}
+                >
+                    <span className="text-xl font-semibold select-none">{initial}</span>
                 </div>
             );
         }
@@ -128,7 +154,8 @@ export default function Profile() {
                 <span className="text-lg opacity-70">?</span>
             </div>
         );
-    }, [form.avatar_kind, form.avatar_value, previewUrl]);
+    }, [form.avatar_kind, form.avatar_value, previewUrl, me?.display_name, me?.email]);
+
 
     if (loading) {
         return (
@@ -145,13 +172,14 @@ export default function Profile() {
 
             {/* Account card — centered under the two cards */}
             <div className="max-w-5xl mx-auto my-5">
-                <AccountSection />
+                <AccountSection/>
             </div>
 
             {/* Centered grid: Avatar + Personal instruction */}
             <div className="grid gap-5 md:grid-cols-2 max-w-5xl mx-auto">
                 {/* Avatar card */}
-                <section className="rounded-2xl border border-[var(--border)] bg-[var(--panel)] shadow-[var(--shadow)] p-4">
+                <section
+                    className="rounded-2xl border border-[var(--border)] bg-[var(--panel)] shadow-[var(--shadow)] p-4">
                     <h2 className="text-right text-lg font-semibold mb-3">תמונת פרופיל</h2>
                     <div className="flex items-center gap-4">
                         {avatarNode}
@@ -179,7 +207,7 @@ export default function Profile() {
                                     <Button
                                         variant="outline"
                                         onClick={() => {
-                                            setForm((f) => ({ ...f, avatar_kind: "", avatar_value: "" }));
+                                            setForm((f) => ({...f, avatar_kind: "", avatar_value: ""}));
                                             if (previewUrl) {
                                                 URL.revokeObjectURL(previewUrl);
                                                 setPreviewUrl("");
@@ -226,21 +254,28 @@ export default function Profile() {
                 </section>
 
                 {/* Personal instruction card */}
-                <section className="rounded-2xl border border-[var(--border)] bg-[var(--panel)] shadow-[var(--shadow)] p-4">
-                    <h2 className="text-right text-lg font-semibold mb-3">הנחיה אישית</h2>
+                <section
+                    className="rounded-2xl border border-[var(--border)] bg-[var(--panel)] shadow-[var(--shadow)] p-4">
+                    <h2 className="text-right text-lg font-semibold mb-3">הנחייה אישית</h2>
+
                     <label className="flex items-center justify-end gap-2 mb-2">
-                        <span>הפעל הנחיה אישית</span>
+                        <span>הפעל הנחייה אישית</span>
                         <input
                             type="checkbox"
                             checked={!!form.instruction_enabled}
-                            onChange={(e) => setForm((f) => ({ ...f, instruction_enabled: e.target.checked }))}
+                            onChange={(e) =>
+                                setForm((f) => ({...f, instruction_enabled: e.target.checked}))
+                            }
                         />
                     </label>
+
                     <textarea
                         className="min-h-[180px] w-full rounded-2xl border border-[var(--border)] bg-[var(--bg)] p-3 text-right"
-                        placeholder="כאן תוכלו לכתוב הנחיות כלליות שיחולו על כל השיחות…"
+                        placeholder="כאן תוכלו לכתוב הנחיות כלליות שיחולו על כל השיחות. לדוגמה, פנה אליי בשם מיכאל וענה על הכל בסגנון הומוריסטי."
                         value={form.instruction_text}
-                        onChange={(e) => setForm((f) => ({ ...f, instruction_text: e.target.value }))}
+                        onChange={(e) =>
+                            setForm((f) => ({...f, instruction_text: e.target.value}))
+                        }
                     />
                 </section>
             </div>

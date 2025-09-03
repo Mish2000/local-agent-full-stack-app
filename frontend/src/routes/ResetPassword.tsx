@@ -8,6 +8,9 @@ import { api } from "@/lib/api";
 import PasswordMeter from "@/components/PasswordMeter";
 import { assessPassword } from "@/lib/validators";
 import { Sparkles } from "lucide-react";
+import { APP_NAME } from "@/config/app";
+
+
 
 export default function ResetPassword() {
     const [sp] = useSearchParams();
@@ -48,15 +51,15 @@ export default function ResetPassword() {
 
     return (
         <div className="min-h-dvh bg-[var(--bg)] text-[var(--text)] grid grid-rows-[auto_1fr]">
-            <header className="sticky top-0 z-40">
-                <div className="container py-3 flex items-center justify-between">
+            <header className="header sticky top-0 z-40">
+                <div className="container py-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
-                        <Sparkles className="size-5" />
-                        <h1 className="text-[20px] font-bold">Agent 2.0 — איפוס סיסמה</h1>
+                        <Sparkles className="size-5 opacity-80" />
+                        <h1 className="text-[20px] font-bold leading-tight">{APP_NAME} — איפוס סיסמה</h1>
                     </div>
                     <nav className="flex items-center gap-3">
-                        <Link to="/" className="hover:underline">בית</Link>
-                        <Link to="/login" className="hover:underline">התחברות</Link>
+                        <Link to="/login" className="text-[15px] font-semibold hover:underline">התחברות</Link>
+                        <Link to="/register" className="text-[15px] font-semibold hover:underline">הרשמה</Link>
                     </nav>
                 </div>
             </header>

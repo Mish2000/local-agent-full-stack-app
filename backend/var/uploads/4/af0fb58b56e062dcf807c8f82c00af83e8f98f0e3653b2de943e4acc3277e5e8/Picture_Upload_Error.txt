@@ -1,0 +1,32 @@
+
+
+
+
+In this conversation your role is to continue guiding me through my final project development. Your guide should be done step by step, and at each step you should provide complete, error-free code ready to be pasted into the project (You don't have to produce full code files, but in case you changed the code of a function or created a new one, you must write it in full). You must verify with me that the step you are implementing works without errors before we proceed to the next step. During the development, you should write and refactor the code by following "best practice" software engineering conventions. For maximum context and to avoid mistakes, I will share the current code of the system with you here, and I will explain now what you should exactly focus on:
+
+1) You forgot to hide AttachmentsShelf in the guest route, a correction should implemented.
+
+2) In the profile section, you need to move all elements except the "Profile and Settings" heading to the center of the page without changing their relative position. In addition, add a functionality there which let the user change and save his display name and password. For the password you should use the same Passwordmeter.tsx which used in the Registration form.
+
+3) Add hover animation for all buttons in the system - search them in the following parts of the UI:
+In the profile section,
+In the conversations list,
+In the composer,
+On the landing page,
+On the Login screen,
+On the Register screen,
+On Password recovery screen.
+
+4) Since the system is undergoing a radical change in terms of core functionality in managing the agent's modes, you must redesign all states, and delete the current ones. In the new version of the system, we will only need the following modes:
+ a) Offline mode: everything is available except for network search, meaning that the LLM will rely on the instruction file (if the user has enabled its use in his profile settings section), and the user will also be able to attach local conversation files as part of a prompt (already implemented). b) Network search mode: the LLM will perform a network search for each prompt it receives. In this mode, the feature of attaching local files to the prompt will not be available (should be explained to the user in an aesthetic way through the UI).
+ c) Automatic mode: In this mode, the LLM must decide on its own whether to perform a network search or not in relation to the user's prompt. If the user decides to attach a file to the prompt, the LLM should first read the file's contents, and only then decide whether it is necessary to perform a network search or not (multi-step inference).
+*)Update: The frontend is already ready in this regard, what remains in this context is to adjust the backend accordingly.
+
+5) Currently, the reading from files (RAG) functionality is very general, and it must undergo a very clear separation: 
+*) Turning the current RAG functionality into a single and personal instruction file for the user. This file will be editable at any time by the user, and will contain general instructions that the user will define within it. The LLM will use these settings for all conversations that the user creates in his account and regardless of the mode in which the user is, for the purpose of personalization with respect to the user, for example, the LLM will use the file to remember the user's name, and to know how to respond specifically to the instructions given in that global file. In addition, the user can always turn off the use of this file , and after turning it off, the LLM will simply stop accessing this file and communicate with the user in all conversations as a general person (frontend is ready already in this context). 
+*)What is implemented in addtion for this context?:
+*) Implementation in the context of reading from files: the user is already able to upload a file as part of a prompt that he sends to the LLM in a specific conversation, and the LLM will read the contents of the file in combination with the user's prompt and respond accordingly. Files of this type that the user attaches in a specific conversation are local to this conversation only, and the LLM does not save the context or read from them in other conversations.
+
+
+
+*) You must provide 100% working code and do not reply back to me before you have verified that the code meets the following requirements: *) In the case of frontend code: write strictly according to correct TS conventions and completely avoid ESLint errors. *) In the case of backend code: make sure to integrate code that is compatible with the rest of the code already written, and completely avoid warnings that may appear in PyCharm.

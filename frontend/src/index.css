@@ -400,4 +400,23 @@ pre { padding: 10px 12px; border-radius: 10px; overflow-x: auto; border: 1px sol
     }
 }
 
+/* === Attachments shelf: anchor left, expand to the RIGHT (robust in RTL) === */
+.attachments-shelf {
+    /* Render this subtree in LTR so intrinsic widths grow toward +X (right) */
+    direction: ltr;
+
+    /* Make sure the shelf itself sits at the inline start (left in LTR) */
+    text-align: left;
+    margin-inline-start: 0 !important;
+    margin-inline-end: auto !important;
+
+    /* Optional: keep stacking above flowing content if needed */
+    z-index: 5;
+}
+
+/* The inner bubble also stays LTR (for filenames and width calculations) */
+.attachments-shelf .attachments-bubble {
+    direction: ltr;
+    text-align: left;
+}
 

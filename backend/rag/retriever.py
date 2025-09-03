@@ -16,14 +16,12 @@ for name in (
     logging.getLogger(name).setLevel(logging.CRITICAL)
     logging.getLogger(name).disabled = True
 
-import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer, CrossEncoder
-
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
-CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
-COLLECTION = os.getenv("CHROMA_COLLECTION", "docs")
-RERANKER_NAME = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
+from .common import (
+    COLLECTION,
+    get_collection,
+    get_embedder,
+    get_reranker_or_none,
+)
 
 # Minimal bilingual stopwords for light query normalization
 _HE_STOP = {
@@ -54,10 +52,9 @@ class Retriever:
     """
 
     def __init__(self, k_initial: int = 12, k_final: int = 5, use_reranker: bool = True):
-        self.client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
-        self.coll = self.client.get_or_create_collection(COLLECTION)
-        self.embedder = SentenceTransformer(EMBED_MODEL_NAME)
-        self.reranker = CrossEncoder(RERANKER_NAME) if use_reranker else None
+        self.coll = get_collection(COLLECTION)
+        self.embedder = get_embedder()
+        self.reranker = get_reranker_or_none() if use_reranker else None
         self.k_initial = k_initial
         self.k_final = k_final
         self.use_reranker = use_reranker

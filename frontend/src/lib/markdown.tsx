@@ -1,6 +1,6 @@
 // src/lib/markdown.tsx
 import * as React from "react";
-import { splitFences } from "@/lib/markdownUtils";
+import {splitFences} from "@/lib/markdownUtils";
 
 type Node =
     | { t: "p"; c: string }
@@ -8,7 +8,7 @@ type Node =
     | { t: "ul"; items: string[] }
     | { t: "code"; lang?: string; c: string };
 
-function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+function CodeBlock({code, lang}: { code: string; lang?: string }) {
     const [copied, setCopied] = React.useState(false);
     const doCopy = async () => {
         try {
@@ -38,7 +38,7 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
                 dir="ltr"
                 className="overflow-x-auto p-3 text-sm leading-relaxed"
                 data-lang={lang || ""}
-                style={{ whiteSpace: "pre", margin: 0, tabSize: 4 }}
+                style={{whiteSpace: "pre", margin: 0, tabSize: 4}}
             >
         <code
             style={{
@@ -61,7 +61,7 @@ function parseBlocks(md: string): Node[] {
     for (const seg of segments) {
         if (seg.kind === "code") {
             const code = seg.body.replace(/\s+$/g, "");
-            nodes.push({ t: "code", lang: seg.lang, c: code });
+            nodes.push({t: "code", lang: seg.lang, c: code});
             continue;
         }
         const text = seg.body.replace(/\r\n/g, "\n");
@@ -71,11 +71,11 @@ function parseBlocks(md: string): Node[] {
 
         const flushPara = () => {
             const content = buffer.join("\n").trim();
-            if (content) nodes.push({ t: "p", c: content });
+            if (content) nodes.push({t: "p", c: content});
             buffer = [];
         };
         const flushList = () => {
-            if (list && list.length) nodes.push({ t: "ul", items: list });
+            if (list && list.length) nodes.push({t: "ul", items: list});
             list = null;
         };
 
@@ -90,7 +90,7 @@ function parseBlocks(md: string): Node[] {
             if (m) {
                 flushList();
                 flushPara();
-                nodes.push({ t: "h", level: m[1].length, c: m[2] });
+                nodes.push({t: "h", level: m[1].length, c: m[2]});
                 continue;
             }
             const li = /^[-*]\s+(.*)$/.exec(line);
@@ -110,7 +110,7 @@ function parseBlocks(md: string): Node[] {
 }
 
 function renderInline(text: string): React.ReactNode {
-    // inline code (split on backticks)
+    // 1) Inline code (split on backticks) — unchanged behavior
     let parts: Array<string | React.ReactNode> = [];
     const segs = text.split(/`/g);
     for (let i = 0; i < segs.length; i++) {
@@ -126,7 +126,31 @@ function renderInline(text: string): React.ReactNode {
         }
     }
 
-    // links [text](url)
+    // Helper: turn **bold** segments into <strong>
+    const boldify = (raw: string, keyPrefix: string): React.ReactNode[] => {
+        const out: React.ReactNode[] = [];
+        const re = /\*\*([^*]+)\*\*/g;
+        let m: RegExpExecArray | null;
+        let last = 0;
+        while ((m = re.exec(raw))) {
+            const before = raw.slice(last, m.index);
+            if (before) out.push(before);
+            out.push(
+                <strong
+                    key={`${keyPrefix}-b-${m.index}`}
+                    className="font-semibold"
+                >
+                    {m[1]}
+                </strong>
+            );
+            last = m.index + m[0].length;
+        }
+        const tail = raw.slice(last);
+        if (tail) out.push(tail);
+        return out;
+    };
+
+    // 2) Links [text](url) — but boldify the text around/inside links
     parts = parts.flatMap((chunk, idx) => {
         if (typeof chunk !== "string") return [chunk];
         const arr: React.ReactNode[] = [];
@@ -136,7 +160,7 @@ function renderInline(text: string): React.ReactNode {
         const str = chunk;
         while ((m = re.exec(str))) {
             const before = str.slice(last, m.index);
-            if (before) arr.push(before);
+            if (before) arr.push(...boldify(before, `pre-${idx}-${m.index}`));
             arr.push(
                 <a
                     key={"lnk" + idx + "-" + m.index}
@@ -145,20 +169,20 @@ function renderInline(text: string): React.ReactNode {
                     rel="noopener noreferrer"
                     className="underline hover:opacity-80"
                 >
-                    {m[1]}
+                    {boldify(m[1], `inlnk-${idx}-${m.index}`)}
                 </a>
             );
             last = m.index + m[0].length;
         }
         const tail = str.slice(last);
-        if (tail) arr.push(tail);
+        if (tail) arr.push(...boldify(tail, `tail-${idx}`));
         return arr;
     });
 
     return parts;
 }
 
-export default function Markdown({ text }: { text: string }) {
+export default function Markdown({text}: { text: string }) {
     const blocks = parseBlocks(text);
     return (
         <div className="space-y-2">
@@ -168,7 +192,7 @@ export default function Markdown({ text }: { text: string }) {
                         const level = Math.min(6, Math.max(1, node.level));
                         return React.createElement(
                             `h${level}`,
-                            { key: i, className: "mt-3 mb-2 font-semibold" },
+                            {key: i, className: "mt-3 mb-2 font-semibold"},
                             renderInline(node.c)
                         );
                     }
@@ -181,7 +205,7 @@ export default function Markdown({ text }: { text: string }) {
                             </ul>
                         );
                     case "code":
-                        return <CodeBlock key={i} code={node.c} lang={node.lang} />;
+                        return <CodeBlock key={i} code={node.c} lang={node.lang}/>;
                     case "p":
                     default:
                         return (
