@@ -385,7 +385,8 @@ class ProfileSettingsIO(BaseModel):
 
 
 # Tools
-from tools.web_search import WebSearcher, _parse_date_heuristic
+from tools.web_search import WebSearcher, _parse_date_heuristic, _apply_relevance_filter, _sort_results, _diversify, \
+    _annotate_debug_fields
 from tools.py_eval import run_python
 
 app = FastAPI()
@@ -470,22 +471,153 @@ def build_context(query: str, docs: List[Dict]) -> Dict:
     return {"context_text": "\n".join(ctx_lines), "citations": cites}
 
 
+# -------- Intent-aware classification (drop-in) --------
+from dataclasses import dataclass
+from enum import Enum
+import re
+
+
+class Intent(str, Enum):
+    FILE_QA = "file_qa"
+    CREATIVE = "creative"
+    TRANSLATION = "translation"
+    SUMMARIZATION = "summarization"
+    CODING = "coding"
+    MATH = "math"
+    DYNAMIC_FACT = "dynamic_fact"  # news/markets/weather/sports/time-sensitive
+    STATIC_FACT = "static_fact"  # stable encyclopedic facts
+    PERSONAL = "personal"  # advice/opinion/chat
+    OTHER = "other"
+
+
+@dataclass
+class IntentDecision:
+    intent: Intent
+    wants_rag: bool
+    wants_web: bool
+    reason: str
+
+
+# Signals (HE+EN)
+_HE_CREATIVE = [
+    r"\bסיפור\b", r"\bשיר\b", r"\bבדיחה\b", r"\bפואמה\b", r"\bהייקו\b", r"\bדיאלוג\b",
+    r"\bכת(ו|בי)\b", r"\bתכתבי\b", r"\bתחברי\b", r"\bדמיינ(י)?\b", r"\bדמות\b"
+]
+_EN_CREATIVE = [
+    r"\bstory\b", r"\bpoem\b", r"\bhaiku\b", r"\bjoke\b", r"\bsong\b", r"\blyrics\b",
+    r"\brole\s*play\b", r"\broleplay\b", r"\bmonologue\b", r"\bdialogue\b", r"\bwrite\b", r"\bcompose\b"
+]
+
+_HE_TRANSLATE = [r"\bתרג(ו|מי|ם|ום)\b", r"\bלתרגם\b", r"\bתרגום\b"]
+_EN_TRANSLATE = [r"\btranslate\b", r"\btranslation\b"]
+
+_HE_SUMMARY = [r"\bסכ(ם|מי|מה)\b", r"\bתקציר\b", r"\bלסכם\b"]
+_EN_SUMMARY = [r"\bsummariz(e|e it|ation)\b", r"\btl;dr\b"]
+
+_HE_MATH = [r"\bחשב\b", r"\bחישוב\b", r"\bאחוז\b", r"\bשבר\b"]
+_EN_MATH = [r"\bcalc(ulate|ulation)?\b", r"\bpercentage\b", r"\bpercent\b"]
+
+# You already have these in code; we reuse them:
+# - _heuristic_wants_rag (doc/file hints)【turn3file6†main.py†L10-L12】
+# - _heuristic_wants_web (explicit “search/google/news” wording)【turn3file6†main.py†L14-L15】
+# - _needs_recency + keyword families (fx/crypto/weather/sports)【turn3file8†main.py†L9-L31】
+# - _is_time_sensitive patterns【turn3file3†main.py†L5-L20】
+
+_cre_pat = [re.compile(p, re.IGNORECASE) for p in (_HE_CREATIVE + _EN_CREATIVE)]
+_trn_pat = [re.compile(p, re.IGNORECASE) for p in (_HE_TRANSLATE + _EN_TRANSLATE)]
+_sum_pat = [re.compile(p, re.IGNORECASE) for p in (_HE_SUMMARY + _EN_SUMMARY)]
+_mth_pat = [re.compile(p, re.IGNORECASE) for p in (_HE_MATH + _EN_MATH)]
+
+_Q_WORDS_EN = re.compile(r"\b(what|who|when|where|why|how|define|explain)\b", re.IGNORECASE)
+_Q_WORDS_HE = re.compile(r"\b(מה|מי|מתי|איפה|למה|כיצד|הגדרה|הסבר)\b")
+
+
+def _looks_creative(q: str) -> bool:
+    return any(p.search(q or "") for p in _cre_pat)
+
+
+def _looks_translation(q: str) -> bool:
+    return any(p.search(q or "") for p in _trn_pat)
+
+
+def _looks_summary(q: str) -> bool:
+    return any(p.search(q or "") for p in _sum_pat)
+
+
+def _looks_math(q: str) -> bool:
+    return any(p.search(q or "") for p in _mth_pat) or bool(re.search(r"\d\s*[\+\-\*/]\s*\d", q or ""))
+
+
+def _looks_coding(q: str) -> bool:
+    if _extract_python_code(q):  # you already have this helper【turn3file14†backend.txt†L41-L54】
+        return True
+    return any(
+        s in (q or "").lower() for s in ["stack trace", "traceback", "exception", "error:", "undefined", "segfault"])
+
+
+def classify_intent(q: str, *, rag_strong: bool, doc_hint: bool) -> IntentDecision:
+    qn = (q or "").strip()
+    if doc_hint:
+        return IntentDecision(Intent.FILE_QA, wants_rag=True, wants_web=False, reason="Explicit file/document hint")
+    if _looks_creative(qn):
+        return IntentDecision(Intent.CREATIVE, wants_rag=False, wants_web=False, reason="Creative generation")
+    if _looks_translation(qn):
+        return IntentDecision(Intent.TRANSLATION, wants_rag=rag_strong, wants_web=False, reason="Translation task")
+    if _looks_summary(qn):
+        # If a URL is present, summary likely needs web. Otherwise, prefer RAG if we have it.
+        has_url = bool(re.search(r"https?://", qn))
+        return IntentDecision(Intent.SUMMARIZATION, wants_rag=rag_strong and not has_url, wants_web=has_url,
+                              reason="Summarization")
+    if _looks_coding(qn):
+        return IntentDecision(Intent.CODING, wants_rag=False, wants_web=False, reason="Coding/debug task")
+    if _looks_math(qn):
+        return IntentDecision(Intent.MATH, wants_rag=False, wants_web=False, reason="Calculation/math task")
+    if _needs_recency(qn) or _is_time_sensitive(qn):
+        return IntentDecision(Intent.DYNAMIC_FACT, wants_rag=rag_strong, wants_web=True,
+                              reason="Time-sensitive/dynamic facts")
+    if _heuristic_wants_web(qn):  # user said “search the web”, etc.
+        return IntentDecision(Intent.DYNAMIC_FACT, wants_rag=rag_strong, wants_web=True,
+                              reason="User explicitly asked to search")
+    # General Q&A: if it looks like a question but not dynamic, treat as static facts.
+    if _Q_WORDS_EN.search(qn) or _Q_WORDS_HE.search(qn):
+        return IntentDecision(Intent.STATIC_FACT, wants_rag=rag_strong, wants_web=False,
+                              reason="Static/encyclopedic query")
+    # Advice/opinion/chatty prompts → keep local
+    return IntentDecision(Intent.PERSONAL, wants_rag=rag_strong, wants_web=False, reason="Personal/advice/chat")
+
+
 def build_web_context(query: str, items: List[Dict]) -> Dict:
+    """
+    Build a lightweight context block from web search items.
+    - No extra ranking/filters here (already done in WebSearcher).
+    - Ensures a 'published' alias exists if only 'published_date' was provided.
+    """
     cites = []
     ctx_lines = []
     for i, it in enumerate(items, start=1):
         url = it.get("url") or ""
-        title = it.get("title") or ""
-        snippet = truncate(it.get("snippet") or title)
+        title = (it.get("title") or "").strip()
+        # Prefer snippet, fallback to content, then title
+        snippet = truncate(it.get("snippet") or it.get("content") or title)
         host = _host_from_url(url)
+
+        # Normalize date alias for the downstream prompt builder
+        published = (it.get("published") or it.get("published_date") or "").strip()
+        if published and "published" not in it:
+            it["published"] = published
+
+        date_tag = f" ({published[:10]})" if published else ""
         cites.append({
             "id": i,
             "source": host,
             "preview": snippet,
-            "score": round(float(it.get("score", 0.0)), 4),
+            "score": round(float(it.get("score") or 0.0), 4),
             "url": url,
+            "published": published,
         })
-        ctx_lines.append(f"[{i}] {title or host} — {host}\n{snippet}\n")
+        # Include host + (YYYY-MM-DD) to nudge the LLM toward dated, sourced statements
+        ctx_lines.append(f"[{i}] {title or host}{date_tag} — {host}\n{snippet}\n")
+
     return {"context_text": "\n".join(ctx_lines), "citations": cites}
 
 
@@ -855,10 +987,11 @@ async def web_test(
     age_stats = {"min": min(ages) if ages else None, "median": (sorted(ages)[len(ages) // 2] if ages else None),
                  "max": max(ages) if ages else None}
 
+    debug["timed_out"] = 1 if timed_out else 0
     return {
         "provider": provider,
         "count": len(items),
-        "debug": debug + [f"timed_out={1 if timed_out else 0}"],
+        "debug": debug,
         "age_stats": age_stats,
         "items": items,
     }
@@ -960,8 +1093,13 @@ def _base_system_prompt(
         f"Otherwise answer in {lang}."
     )
 
+    anti_tokens = (
+        " Output rule: Never include special placeholder tokens such as "
+        "<EOS_TOKEN>, <BOS_TOKEN>, <CLS>, <SEP>, <MASK_TOKEN>, <PAD>, or raw tokenizer markers."
+    )
+
     return (
-        f"You are a helpful assistant. {lang_rule} {policy}{web_note}{tools_rules}{timeout_note}{personal_section}"
+        f"You are a helpful assistant. {lang_rule} {policy}{web_note}{tools_rules}{anti_tokens}{timeout_note}{personal_section}"
     )
 
 
@@ -1028,6 +1166,24 @@ _PY_LINE_SIG = re.compile(
     ^\s*(?:from\s+\w[\w\.]*\s+import\s+|import\s+\w[\w\.]*\s*|print\s*\(|def\s+\w+\s*\(|class\s+\w+\s*\(|for\s+\w+\s+in\s+|while\s+|if\s+__name__\s*==\s*['"]__main__['"])
     """
 )
+
+_SPECIAL_TOKEN_RE = re.compile(
+    r"</?\s*(?:EOS|BOS|CLS|SEP|MASK|PAD)_?TOKEN\s*>|<\|im_end\|>", re.IGNORECASE
+)
+
+
+def _sanitize_stream_token(tok: str) -> str:
+    if not tok:
+        return tok
+    return _SPECIAL_TOKEN_RE.sub("", tok)
+
+
+def _clean_llm_text(text: str) -> str:
+    s = _SPECIAL_TOKEN_RE.sub("", text or "")
+    # Remove empty code fences the model sometimes emits when it glitches
+    s = re.sub(r"```(?:\w+)?\s*```", "", s)
+    # Remove stray zero-width chars that occasionally appear
+    return s.replace("\u200b", "").strip()
 
 
 def _extract_python_code(text: str) -> Optional[str]:
@@ -1329,10 +1485,13 @@ async def chat_stream(
                         had_error = True
                         yield sse("error", json.dumps({"message": token}))
                         break
+                    token = _sanitize_stream_token(token)
+                    if not token:
+                        continue
                     assistant_chunks.append(token)
                     yield sse("token", token)
 
-                full_reply = "".join(assistant_chunks).strip()
+                full_reply = _clean_llm_text("".join(assistant_chunks))
                 if db_user and db_chat and not had_error:
                     await _persist_assistant_message(int(db_chat.id), full_reply)
 
@@ -1377,31 +1536,34 @@ async def chat_stream(
             elif mode == "web":
                 ws = WebSearcher()
                 sanitized = _sanitize_web_query(q) or (q[:200] if q else "")
+                ws_args = _classify_web_strategy(q)  # topic + days (same helper you use in AUTO)
+
                 items: List[Dict] = []
                 provider = "none"
                 debug: Dict = {}
                 timed_out = False
                 try:
+                    # Ask for a bit more and let the deduper + diversifier prune
                     items, provider, debug, timed_out = await ws.search(
                         sanitized,
-                        max_results=6,
+                        max_results=10,
                         timeout=20.0,
                         time_budget_sec=60.0,
+                        **ws_args,
                     )
                 except Exception as e:
                     debug = {"error": str(e)}
 
                 ev = {
                     "name": "web_search",
-                    "args": {"query": sanitized or "(skipped)"},
+                    "args": {"query": sanitized or "(skipped)", **{k: v for k, v in ws_args.items() if v is not None}},
                     "result": {"provider": provider, "count": len(items)},
                     "debug": debug,
                 }
                 yield sse("tool", json.dumps(ev, ensure_ascii=False))
                 tracer_local.log_tool(
-                    trace_id,
-                    "web_search",
-                    {"query": sanitized or "(skipped)"},
+                    trace_id, "web_search",
+                    {"query": sanitized or "(skipped)", **{k: v for k, v in ws_args.items() if v is not None}},
                     {"provider": provider, "count": len(items)},
                 )
                 used_tool = True
@@ -1471,9 +1633,26 @@ async def chat_stream(
                 # Decide if we ALSO need the web. We’re stricter here:
                 # - Always use web for clearly time-sensitive or market questions (even if RAG is strong).
                 # - If RAG is weak, use web as well.
-                needs_fresh = _needs_recency(q) or any(
-                    t in (q or "").lower() for t in _CURRENCY_LIKE + _CRYPTO_LIKE + _WEATHER_LIKE + _SPORTS_LIKE)
-                wants_web = needs_fresh or (not rag_strong)
+                doc_hint = _heuristic_wants_rag(q)  # already present earlier
+                decision = classify_intent(q, rag_strong=bool(rag_strong), doc_hint=bool(doc_hint))
+
+                # Optional: emit a trace event so you can see why auto chose its path
+                yield sse("tool", json.dumps({
+                    "name": "auto_intent",
+                    "args": {"query": q},
+                    "result": {
+                        "intent": decision.intent,
+                        "wants_rag": decision.wants_rag,
+                        "wants_web": decision.wants_web,
+                        "reason": decision.reason,
+                    },
+                }, ensure_ascii=False))
+                tracer_local.log_tool(trace_id, "auto_intent", {"query": q}, {
+                    "intent": decision.intent, "wants_rag": decision.wants_rag,
+                    "wants_web": decision.wants_web, "reason": decision.reason
+                })
+
+                wants_web = bool(decision.wants_web)
 
                 citations_combined: List[Dict] = []
                 prompt: str
@@ -1556,10 +1735,13 @@ async def chat_stream(
                     had_error = True
                     yield sse("error", json.dumps({"message": token}))
                     break
+                token = _sanitize_stream_token(token)
+                if not token:
+                    continue
                 assistant_chunks.append(token)
                 yield sse("token", token)
 
-            full_reply = "".join(assistant_chunks).strip()
+            full_reply = _clean_llm_text("".join(assistant_chunks))
             if db_user and db_chat and not had_error:
                 await _persist_assistant_message(int(db_chat.id), full_reply)
 

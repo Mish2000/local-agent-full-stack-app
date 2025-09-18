@@ -12,11 +12,11 @@ import {ArrowDown} from "lucide-react";
 import {toast} from "sonner";
 import Sidebar from "@/features/layout/Sidebar.tsx";
 import ExportPDF from "@/features/chat/ExportPDF.tsx";
-// Removed usePerChatMode + setChatMode to avoid resets; we use the new hook:
 import {saveLastForChat, loadLastForChat, clearLastForChat} from "@/lib/reasoningStorage";
 import AttachmentsShelf from "@/features/chat/AttachmentsShelf.tsx";
 import DragDropOverlay from "@/components/DragDropOverlay";
 import {useChatMode} from "@/lib/modes";
+import ConfirmDialog from "@/components/ConfirmDialog";
 
 import {
     createChat,
@@ -69,6 +69,9 @@ export default function Chat({variant = "full"}: { variant?: Variant }) {
 
     const [chats, setChats] = useState<ChatSummary[]>([]);
     const [loadingChats, setLoadingChats] = useState<boolean>(!isGuest);
+
+    const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
+
 
     // Auto-title trigger for the very first user turn (text OR files)
     const firstTurnRef = useRef<{ chatId: number | null; shouldAuto: boolean; firstText: string }>({
@@ -620,24 +623,10 @@ export default function Chat({variant = "full"}: { variant?: Variant }) {
         }
     };
 
-    const doDeleteChat = async (id: number) => {
-        if (!confirm("למחוק את השיחה?")) return;
-        try {
-            await deleteChat(id);
-            setChats((prev) => prev.filter((c) => c.id !== id));
-            if (activeChatId === id) {
-                setActiveChatId(null);
-                setMessages([]);
-                setSourcesByIdx({});
-                setLastSources(null);
-                setLastTools([]);
-                setLastTraceId(null);
-                clearLastForChat(id);
-            }
-        } catch {
-            toast.error("Delete failed");
-        }
+    const doDeleteChat = (id: number) => {
+        setPendingDeleteId(id);
     };
+
 
     const onAuthNavigate = async () => {
         if (isGuest && cid) {
@@ -764,6 +753,49 @@ export default function Chat({variant = "full"}: { variant?: Variant }) {
                     ) : null
                 }
             />
+
+            <ConfirmDialog
+                open={pendingDeleteId !== null}
+                dir="rtl"
+                title="למחוק את השיחה?"
+                message="הפעולה תמחק לצמיתות את כל התוכן כולל נתונים משויכים. לא יתאפשר שחזור."
+                confirmText="מחק שיחה"
+                cancelText="ביטול"
+                destructive
+                onCancel={() => setPendingDeleteId(null)}
+                onConfirm={async () => {
+                    if (pendingDeleteId == null) return;
+                    const id = pendingDeleteId;
+
+                    // Close the dialog immediately for a snappy feel
+                    setPendingDeleteId(null);
+
+                    // If an SSE is streaming for this chat, close it to avoid orphaned streams
+                    if (esRef.current && esChatIdRef.current === id) {
+                        try { esRef.current.close(); } catch { /* ignore */ }
+                        esRef.current = null;
+                        setStreaming(false);
+                    }
+
+                    try {
+                        await deleteChat(id);
+                        setChats(prev => prev.filter(c => c.id !== id));
+
+                        if (activeChatId === id) {
+                            setActiveChatId(null);
+                            setMessages([]);
+                            setSourcesByIdx({});
+                            setLastSources(null);
+                            setLastTools([]);
+                            setLastTraceId(null);
+                            clearLastForChat(id);
+                        }
+                    } catch {
+                        toast.error("Delete failed");
+                    }
+                }}
+            />
+
         </div>
     );
 }
